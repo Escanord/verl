@@ -130,3 +130,8 @@ logs
 log
 outputs
 .history
+.claude/
+# core dumps and large wheels (no use in repo)
+core
+core.*
+*.whl

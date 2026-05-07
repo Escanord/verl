@@ -170,11 +170,17 @@ class vLLMColocateWorkerExtension:
         instance._is_modelopt_qat = _is_modelopt_qat
         return instance
 
-    def monkey_patch_model(self, vocab_size: int):
+    def monkey_patch_model(self, vocab_size: int, pivot_cfg: dict = None):
         # patch compute_logits to avoid sampling OOV token
         monkey_patch_compute_logits(self.model_runner.model, vocab_size)
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
+        # patch model for PIVOT v1: attaches attention Q/K hooks for walk signal
+        # (PIVOT v2 computes ΔVar directly from logits in apply() — no model patch needed)
+        pivot_version = (pivot_cfg or {}).get("pivot_version", 1)
+        if pivot_cfg and pivot_version == 1:
+            from verl.utils.vllm.pivot_patch import patch_attention_layers_pivot
+            patch_attention_layers_pivot(self.model_runner.model)
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""

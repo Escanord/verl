@@ -54,7 +54,10 @@ def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, 
         elif "min" in key:
             metrics[key] = np.min(val)
         else:
-            metrics[key] = np.mean(val)
+            try:
+                metrics[key] = np.mean(val)
+            except (ValueError, TypeError) as _e:
+                raise ValueError(f"reduce_metrics failed on key={key!r} val={val!r}") from _e
     return metrics
 
 

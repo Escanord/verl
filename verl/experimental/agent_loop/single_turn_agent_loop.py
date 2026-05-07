@@ -34,19 +34,25 @@ class SingleTurnAgentLoop(AgentLoopBase):
         self.response_length = self.rollout_config.response_length
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        messages = list(kwargs["raw_prompt"])
+        # Phase 2 hard fork passes pre-tokenized ids directly to skip chat template.
+        if "prompt_token_ids" in kwargs and kwargs["prompt_token_ids"] is not None:
+            prompt_ids = [int(t) for t in kwargs["prompt_token_ids"]]
+            multi_modal_data = {}
+            images, videos = None, None
+        else:
+            messages = list(kwargs["raw_prompt"])
 
-        # 1. extract images and videos from messages
-        multi_modal_data = await self.process_vision_info(messages)
-        images = multi_modal_data.get("images")
-        videos = multi_modal_data.get("videos")
+            # 1. extract images and videos from messages
+            multi_modal_data = await self.process_vision_info(messages)
+            images = multi_modal_data.get("images")
+            videos = multi_modal_data.get("videos")
 
-        # 2. apply chat template and tokenize
-        prompt_ids = await self.apply_chat_template(
-            messages,
-            images=images,
-            videos=videos,
-        )
+            # 2. apply chat template and tokenize
+            prompt_ids = await self.apply_chat_template(
+                messages,
+                images=images,
+                videos=videos,
+            )
 
         # 3. generate sequences
         metrics = {}
@@ -60,6 +66,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             )
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+
         response_mask = [1] * len(output.token_ids)
 
         output: AgentLoopOutput = AgentLoopOutput(

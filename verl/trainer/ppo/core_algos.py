@@ -303,6 +303,15 @@ def compute_grpo_outcome_advantage(
     """
     scores = token_level_rewards.sum(dim=-1)
 
+    if config is not None:
+        _lp_coef = float(getattr(config, "length_penalty_coef", 0.0))
+        if _lp_coef > 0.0:
+            _lp_min_len = float(getattr(config, "length_penalty_min_len", 500.0))
+            _resp_lens = response_mask.sum(dim=-1).float()
+            _len_factor = (_resp_lens / _lp_min_len).clamp(max=1.0)
+            _correct_mask = (scores > 0).float()
+            scores = scores + _lp_coef * (_len_factor - 1.0) * _correct_mask
+
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
@@ -2483,3 +2492,439 @@ def compute_policy_loss_bypass_mode(
     pg_metrics.update(rollout_metrics)
 
     return pg_loss, pg_metrics
+
+
+def get_global_entropy_top_mask(
+    entropy: torch.Tensor,
+    response_mask: torch.Tensor,
+    top_ratio: float = 0.2,
+) -> torch.Tensor:
+    """
+    Select the top ``top_ratio`` fraction of response tokens by per-token entropy.
+
+    Tokens in the top entropy percentile are assigned 1; all others 0.
+    Used by High-Entropy RL to focus policy-gradient updates on uncertain
+    ("forking") tokens and mask out routine low-entropy tokens.
+
+    Reference: "Beyond the 80/20 Rule: High-Entropy Minority Tokens Drive
+    Effective Reinforcement Learning for LLM Reasoning",
+    Wang et al., NeurIPS 2025 (https://arxiv.org/abs/2506.01939).
+
+    Args:
+        entropy: (B, S) per-token entropy from the current policy.
+        response_mask: (B, S) binary mask (1 = response token).
+        top_ratio: fraction of response tokens to keep (e.g. 0.2 = top 20%).
+
+    Returns:
+        (B, S) long tensor — 1 for selected top-entropy tokens, 0 otherwise.
+    """
+    flat_entropy = entropy.flatten()
+    flat_mask = response_mask.flatten().bool()
+
+    response_entropy = flat_entropy[flat_mask]
+    if response_entropy.numel() == 0:
+        return torch.zeros_like(entropy, dtype=torch.long)
+
+    # ceil so we always select at least 1 token
+    top_k = max(1, int(len(response_entropy) * top_ratio + 0.9999))
+    _, topk_idx = torch.topk(response_entropy, k=top_k)
+
+    response_positions = flat_mask.nonzero(as_tuple=False).squeeze(1)
+    top_positions = response_positions[topk_idx]
+
+    flat_out = torch.zeros_like(flat_entropy, dtype=torch.long)
+    flat_out[top_positions] = 1
+    return flat_out.view_as(entropy)
+
+
+def apply_walk_weighted_advantage(
+    advantages: torch.Tensor,
+    walk_importance: torch.Tensor,
+    response_mask: torch.Tensor,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """
+    Reweight GRPO advantages by walk-based token importance scores.
+
+    Implements Â_t = Â * (1 + alpha * w̃_block(t)) from W-GRPO, where
+    w̃_block(t) is the z-score-normalized, layer-averaged walk importance
+    for the block containing token t.
+
+    Walk importance scores are stop-gradient constants (computed from the
+    old policy's Q/K projections), so backprop flows only through log π_θ.
+
+    walk_importance is ReLU'd z-score normalized, so values are in [0, inf).
+    weight = 1 + alpha * walk >= 1 always: below-average tokens are unaffected,
+    above-average tokens are amplified.
+
+    Args:
+        advantages:      (B, response_length) — GRPO advantages (already normalized).
+        walk_importance: (B, response_length) — walk scores from WalkImportanceComputer,
+                         zero outside response tokens.
+        response_mask:   (B, response_length) — binary mask for response tokens.
+        alpha:           Weighting strength. alpha=0 recovers standard GRPO.
+
+    Returns:
+        (B, response_length) reweighted advantages.
+    """
+    weight = (1.0 + alpha * walk_importance).clamp(min=0.0)
+    return advantages * weight * response_mask
+
+
+def compute_differential_walk(
+    walk_importance: torch.Tensor,
+    token_level_scores: torch.Tensor,
+    response_mask: torch.Tensor,
+    n: int,
+) -> tuple[torch.Tensor, float]:
+    """
+    W-GRPO v6: Differential walk importance (Option A).
+
+    For each prompt group of n rollouts, computes:
+        delta_wi[t] = ReLU(mean_{above-avg-reward} wi[t] - mean_{below-avg-reward} wi[t])
+
+    Structural tokens equally attended in both correct and wrong rollouts cancel
+    out in the difference. Only tokens whose attention structure specifically
+    differs between correct and wrong solutions get nonzero scores.
+
+    Falls back to absolute walk scores for groups with uniform reward (no contrast
+    available — matches GRPO's zero-advantage case).
+
+    Assumes n consecutive rows in the batch belong to the same prompt (interleaved
+    repeat layout used by verl's rollout).
+
+    Args:
+        walk_importance:    (B, response_len) — per-rollout v5 walk scores in [0,1].
+        token_level_scores: (B, response_len) — per-token reward (sum = scalar reward).
+        response_mask:      (B, response_len) — binary mask.
+        n:                  Rollouts per prompt (must divide B evenly).
+
+    Returns:
+        Tuple of:
+        - (B, response_len) differential walk scores in [0,1], same value shared
+          by all n rollouts in a prompt group.
+        - float fraction of prompt groups with no reward contrast (fell back to
+          absolute walk).
+    """
+    B = walk_importance.size(0)
+    assert B % n == 0, f"Batch size {B} must be divisible by n={n}"
+    num_prompts = B // n
+
+    scalar_rewards = (token_level_scores * response_mask.float()).sum(dim=-1)  # (B,)
+
+    output = torch.zeros_like(walk_importance)
+    no_contrast_count = 0
+
+    for p in range(num_prompts):
+        s, e = p * n, (p + 1) * n
+        wi_group = walk_importance[s:e]   # (n, response_len)
+        r_group = scalar_rewards[s:e]     # (n,)
+        r_mean = r_group.mean()
+
+        above = r_group > r_mean   # above-average reward → "correct" direction
+        below = ~above
+
+        if not above.any() or not below.any():
+            # All same reward — no contrast, fall back to absolute walk scores
+            output[s:e] = wi_group
+            no_contrast_count += 1
+            continue
+
+        wi_above = wi_group[above].mean(0)   # (response_len,)
+        wi_below = wi_group[below].mean(0)   # (response_len,)
+        delta = torch.relu(wi_above - wi_below)
+
+        delta_max = delta.max().clamp(min=1e-6)
+        delta_norm = delta / delta_max
+
+        # Same weight for all rollouts in this group
+        output[s:e] = delta_norm.unsqueeze(0).expand(n, -1)
+
+    no_contrast_frac = no_contrast_count / max(num_prompts, 1)
+    return output * response_mask.float(), no_contrast_frac
+
+
+def apply_walk_pure_advantage(
+    advantages: torch.Tensor,
+    walk_importance: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    W-GRPO v11: Walk as direct advantage gate — no additive baseline.
+
+    Replaces the (1 + α·w̃) formulation with pure multiplication:
+
+        Â_t = A_i · δ_w[t]
+
+    where δ_w[t] is the differential walk score in [0, 1] (v6 computation).
+
+    Philosophical shift: outcome advantage A_i determines sign and scale;
+    walk determines WHICH positions receive gradient. Tokens with δ_w[t] = 0
+    receive zero gradient — only positions that are structurally differentiating
+    between correct and wrong rollouts contribute to the policy update.
+
+    Contrast with apply_walk_weighted_advantage where zero-walk tokens still
+    receive full GRPO gradient (baseline weight = 1). Here, zero-walk tokens
+    are completely gated out. The walk IS the process reward, not a modifier.
+
+    Args:
+        advantages:      (B, response_length) — GRPO advantages (sequence-level
+                         scalar broadcast to each response token).
+        walk_importance: (B, response_length) — differential walk scores in [0, 1],
+                         zero outside response tokens.
+        response_mask:   (B, response_length) — binary mask.
+
+    Returns:
+        (B, response_length) walk-gated advantages.
+    """
+    return advantages * walk_importance * response_mask
+
+
+def apply_pivot_advantage(
+    advantages: torch.Tensor,
+    pivot_scores: torch.Tensor,
+    response_mask: torch.Tensor,
+    mode: str = "soft",
+    threshold: float = 0.3,
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """
+    PIVOT advantage gating via temporal walk change scores.
+
+    mode="soft":
+        Â_t = A_i · (1 + alpha · pivot_scores[t])
+        Continuously upweights structural change positions. alpha=0 → standard GRPO.
+
+    mode="binary":
+        Â_t = A_i · (pivot_scores[t] > threshold)
+        Hard mask: only positions in P_causal receive gradient. Equivalent to
+        training exclusively on the set of positions where Langevin ran.
+
+    Args:
+        advantages:   (B, response_length) — GRPO advantages.
+        pivot_scores: (B, response_length) — normalised ||ΔR_t|| scores from
+                      TemporalWalkComputer, in [0, 1] for "relu_max" norm mode.
+        response_mask:(B, response_length) — binary mask.
+        mode:         "soft" or "binary".
+        threshold:    binary mask threshold (only used when mode="binary").
+        alpha:        upweighting coefficient (only used when mode="soft").
+
+    Returns:
+        (B, response_length) PIVOT-gated advantages.
+    """
+    if mode == "soft":
+        weight = (1.0 + alpha * pivot_scores).clamp(min=0.0)
+    elif mode == "binary":
+        weight = (pivot_scores > threshold).float()
+    else:
+        raise ValueError(f"Unknown PIVOT mode: {mode!r}. Use 'soft' or 'binary'.")
+    return advantages * weight * response_mask
+
+
+def compute_group_normalized_walk(
+    walk_importance: torch.Tensor,
+    response_mask: torch.Tensor,
+    n: int,
+) -> torch.Tensor:
+    """
+    W-GRPO v10: Per-position z-score normalization across rollouts in a group.
+
+    Analogous to GRPO's per-group advantage normalization (r_i - mean(r)) / std(r),
+    but applied to walk scores at each token position across the n rollouts sharing
+    a prompt:
+
+        w_norm[i, t] = (w[i, t] - mean_n(w[:, t])) / std_n(w[:, t])
+
+    At positions where correct rollouts attend more strongly than wrong rollouts,
+    correct rollouts get positive z-scores and wrong rollouts get negative z-scores —
+    the differential signal emerges naturally without explicit reward-conditional
+    splitting.
+
+    No ReLU: negative scores are kept, allowing below-average-walk tokens to be
+    dampened (weight < 1). The clamp(min=0) in apply_walk_weighted_advantage
+    prevents advantage sign-flips.
+
+    When all rollouts in a group have the same reward (uniform), advantages are
+    zero anyway, so the walk weights have no effect regardless of w_norm values.
+
+    Args:
+        walk_importance: (B, response_len) — per-rollout walk scores in [0, 1].
+        response_mask:   (B, response_len) — binary mask, zero outside response.
+        n:               Rollouts per prompt (must divide B evenly).
+
+    Returns:
+        (B, response_len) z-scored walk importance, zero outside response tokens.
+    """
+    B = walk_importance.size(0)
+    assert B % n == 0, f"Batch size {B} must be divisible by n={n}"
+    num_prompts = B // n
+
+    output = torch.zeros_like(walk_importance)
+
+    for p in range(num_prompts):
+        s, e = p * n, (p + 1) * n
+        wi_group = walk_importance[s:e]                        # (n, response_len)
+
+        mean_t = wi_group.mean(0, keepdim=True)                # (1, response_len)
+        std_t  = wi_group.std(0, keepdim=True).clamp(min=1e-6) # (1, response_len)
+        w_norm = (wi_group - mean_t) / std_t                   # (n, response_len)
+
+        output[s:e] = w_norm
+
+    return output * response_mask.float()
+
+
+def compute_fork_amplification(
+    delta_walk: torch.Tensor,
+    response_mask: torch.Tensor,
+    block_size: int,
+    n: int,
+    fork_boost: float = 2.0,
+    fork_k: int = 1,
+) -> tuple[torch.Tensor, float]:
+    """
+    W-GRPO v7/v9: Fork-block gradient concentration (Option C, soft version).
+
+    Identifies fork blocks in the response (where correct and wrong solutions
+    diverge most in attention structure) and amplifies walk weights there by
+    fork_boost.
+
+    fork_k=1 (v7): argmax — single block, deterministic.
+    fork_k>1 (v9): sample k blocks without replacement from
+        softmax(group_block_scores), amplify all k blocks. Covers a wider
+        region of the divergence area without locking onto a single noisy peak.
+
+    Args:
+        delta_walk:    (B, response_len) — v6 differential walk scores in [0,1].
+        response_mask: (B, response_len) — binary mask.
+        block_size:    Tokens per block (must match WalkImportanceComputer.block_size).
+        n:             Rollouts per prompt.
+        fork_boost:    Amplification factor at fork blocks (default 2.0).
+        fork_k:        Number of blocks to amplify per group (default 1 = argmax).
+
+    Returns:
+        Tuple of:
+        - (B, response_len) amplified walk scores.
+        - float mean of highest-scoring fork block index across groups (for logging).
+    """
+    import torch.nn.functional as F
+
+    B, response_len = delta_walk.shape
+    assert B % n == 0
+    num_prompts = B // n
+
+    num_blocks = (response_len + block_size - 1) // block_size
+    pad = num_blocks * block_size - response_len
+    padded = F.pad(delta_walk, (0, pad)) if pad else delta_walk
+    block_scores = padded.view(B, num_blocks, block_size).mean(dim=-1)  # (B, num_blocks)
+
+    output = delta_walk.clone()
+    peak_fork_blocks = []  # highest-scoring selected block per group (for logging)
+
+    for p in range(num_prompts):
+        s, e = p * n, (p + 1) * n
+        group_block_scores = block_scores[s:e].mean(0)  # (num_blocks,)
+
+        if fork_k == 1:
+            selected = [int(group_block_scores.argmax().item())]
+        else:
+            k = min(fork_k, num_blocks)
+            probs = F.softmax(group_block_scores.float(), dim=0)
+            # Sample k blocks without replacement
+            selected = torch.multinomial(probs, num_samples=k, replacement=False).tolist()
+
+        # Log the highest-scoring selected block
+        peak_fork_blocks.append(max(selected, key=lambda b: group_block_scores[b].item()))
+
+        for fork_block in selected:
+            tok_start = fork_block * block_size
+            tok_end = min(tok_start + block_size, response_len)
+            output[s:e, tok_start:tok_end] = output[s:e, tok_start:tok_end] * fork_boost
+
+    mean_fork_block = sum(peak_fork_blocks) / max(len(peak_fork_blocks), 1)
+    return output * response_mask.float(), mean_fork_block
+
+
+def find_hard_fork_positions(
+    walk_importance: torch.Tensor,
+    token_level_scores: torch.Tensor,
+    response_mask: torch.Tensor,
+    n: int,
+    block_size: int,
+    fork_k: int = 1,
+) -> list[tuple[int, int, int]]:
+    """
+    W-GRPO v8/v9: Find per-group fork positions for hard fork generation.
+
+    For each prompt group with at least one above-average-reward rollout, returns:
+      - group_start:     batch index of first rollout in the group
+      - fork_tok:        token offset for the prefix endpoint — the highest-scoring
+                         of the k sampled fork blocks (block-aligned)
+      - correct_abs_idx: absolute batch index of the highest-reward rollout to use
+                         as the correct prefix source
+
+    fork_k=1: argmax (v8 behaviour).
+    fork_k>1: sample k blocks from softmax(group_block_scores), use the highest-
+              scoring sampled block as the hard fork position. The soft boost in
+              compute_fork_amplification covers all k blocks; the hard fork uses
+              only the peak to keep the prefix-conditioned generation focused.
+
+    Only groups with at least one above-average-reward rollout are returned.
+    Groups with uniform reward are skipped — no correct prefix to condition on.
+
+    Args:
+        walk_importance:    (B, response_len) — differential walk scores (v6 output).
+        token_level_scores: (B, response_len) — per-token reward (sum = scalar reward).
+        response_mask:      (B, response_len) — binary mask.
+        n:                  Rollouts per prompt.
+        block_size:         Tokens per walk block.
+        fork_k:             Number of blocks sampled for soft boost; hard fork uses
+                            the highest-scoring of these (default 1 = argmax).
+
+    Returns:
+        List of (group_start, fork_tok, correct_abs_idx) for forked groups only.
+    """
+    import torch.nn.functional as F
+
+    B, response_len = walk_importance.shape
+    assert B % n == 0
+    num_prompts = B // n
+
+    scalar_rewards = (token_level_scores * response_mask.float()).sum(-1)  # (B,)
+
+    num_blocks = (response_len + block_size - 1) // block_size
+    pad = num_blocks * block_size - response_len
+    padded = F.pad(walk_importance, (0, pad)) if pad else walk_importance
+    block_scores_all = padded.view(B, num_blocks, block_size).mean(-1)  # (B, num_blocks)
+
+    results = []
+    for p in range(num_prompts):
+        s, e = p * n, (p + 1) * n
+        r_group = scalar_rewards[s:e]
+        r_mean = r_group.mean()
+        above_mask = r_group > r_mean
+        if not above_mask.any():
+            continue  # no correct rollouts — skip
+
+        group_block_scores = block_scores_all[s:e].mean(0)  # (num_blocks,)
+
+        if fork_k == 1:
+            selected = [int(group_block_scores.argmax().item())]
+        else:
+            k = min(fork_k, num_blocks)
+            probs = F.softmax(group_block_scores.float(), dim=0)
+            selected = torch.multinomial(probs, num_samples=k, replacement=False).tolist()
+
+        # Hard fork at the highest-scoring sampled block
+        fork_block = max(selected, key=lambda b: group_block_scores[b].item())
+        fork_tok = fork_block * block_size
+
+        # Pick the highest-reward correct rollout as prefix source
+        above_indices = above_mask.nonzero(as_tuple=True)[0]
+        best_in_above = int(r_group[above_indices].argmax().item())
+        correct_abs_idx = s + int(above_indices[best_in_above].item())
+
+        results.append((s, fork_tok, correct_abs_idx))
+
+    return results
+

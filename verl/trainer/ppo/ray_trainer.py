@@ -42,7 +42,17 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.core_algos import (
+    AdvantageEstimator,
+    agg_loss,
+    apply_walk_weighted_advantage,
+    apply_walk_pure_advantage,
+    apply_pivot_advantage,
+    compute_differential_walk,
+    compute_group_normalized_walk,
+    compute_fork_amplification,
+    find_hard_fork_positions,
+)
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -192,6 +202,7 @@ def compute_advantage(
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -461,6 +472,42 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    def _print_sample_rollouts(self, batch: DataProto) -> None:
+        """Print one question's rollouts to stdout for empirical inspection."""
+        uids = batch.non_tensor_batch.get("uid", None)
+        if uids is None:
+            return
+        n = self.config.actor_rollout_ref.rollout.n
+        first_uid = uids[0]
+        indices = [i for i, u in enumerate(uids) if u == first_uid][:n]
+
+        prompt_text = self.tokenizer.decode(batch.batch["prompts"][indices[0]], skip_special_tokens=True)
+
+        if "token_level_scores" in batch.batch:
+            scores = batch.batch["token_level_scores"].sum(-1)
+        else:
+            scores = [0.0] * len(uids)
+
+        gt = batch[indices[0]].non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+
+        sep = "=" * 80
+        lines = [
+            "",
+            sep,
+            f"[ROLLOUT SAMPLE] step={self.global_steps}  n={len(indices)}  gt={gt}",
+            f"PROMPT: ...{prompt_text[-400:]}",
+            sep,
+        ]
+        for rank, idx in enumerate(indices):
+            resp_text = self.tokenizer.decode(batch.batch["responses"][idx], skip_special_tokens=True)
+            score = scores[idx].item() if hasattr(scores[idx], "item") else scores[idx]
+            resp_len = int(batch.batch["response_mask"][idx].sum().item()) if "response_mask" in batch.batch else len(resp_text)
+            lines.append(f"[{rank}] score={score:.3f}  len={resp_len}")
+            lines.append(resp_text[:600])
+            lines.append("-" * 40)
+        lines.append(sep)
+        print("\n".join(lines), flush=True)
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1190,11 +1237,129 @@ class RayPPOTrainer:
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
+    def _compute_walk_scores(self, batch: DataProto) -> DataProto:
+        """Compute walk-based token importance scores for advantage reweighting."""
+        walk_output = self.actor_rollout_wg.compute_walk_scores(batch)
+        return walk_output
+
+    def _compute_pivot_scores(self, batch: DataProto) -> DataProto:
+        """Compute PIVOT temporal walk change scores (||ΔR_t||) for loss gating."""
+        return self.actor_rollout_wg.compute_pivot_scores(batch)
+
+    def _compute_fork_scores_v2(self, batch: DataProto) -> DataProto:
+        """Compute PIVOT-v2 representation divergence fork scores for loss gating."""
+        return self.actor_rollout_wg.compute_fork_scores_v2(batch)
+
+    def _save_fork_profile(
+        self,
+        pivot_scores: torch.Tensor,   # (B, response_len)
+        response_mask: torch.Tensor,  # (B, response_len)
+        profile_path: str,
+    ) -> None:
+        """Save batch-averaged fork score profile for PIVOT-v2 Phase 2 trigger."""
+        import numpy as np
+        rm = response_mask.float()
+        n = rm.sum(dim=0).clamp(min=1.0)
+        profile = (pivot_scores * rm).sum(dim=0) / n  # (response_len,)
+        np.save(profile_path, profile.cpu().numpy())
+
+    def _build_fork2_gen_batch(
+        self, batch: DataProto, fork_results: list[tuple[int, int, int]], n_rollouts: int
+    ) -> DataProto:
+        """
+        Build a generation batch for Phase 2 hard fork rollouts (W-GRPO v8).
+
+        For each group in fork_results, constructs:
+            extended_prompt = original_prompt_tokens + correct_prefix_tokens[:fork_tok]
+
+        The extended prompts are left-padded to a common length. non_tensor_batch
+        fields needed by the reward manager (reward_model, data_source, uid, etc.)
+        are copied from the corresponding Phase 1 group — new UIDs are assigned so
+        Phase 2 GRPO groups are independent from Phase 1.
+
+        Returns a DataProto ready to pass to generate_sequences(), repeated n_rollouts
+        times (interleaved), matching the Phase 1 gen batch format.
+        """
+        prompts = batch.batch["prompts"]    # (B, prompt_len)
+        responses = batch.batch["responses"]  # (B, response_len)
+        pad_id = self.tokenizer.pad_token_id
+        ntb = batch.non_tensor_batch
+
+        extended_ids_list = []
+        reward_model_list = []
+        data_source_list = []
+        extra_info_list = []
+        raw_prompt_list = []
+        has_extra_info = "extra_info" in ntb
+        has_raw_prompt = "raw_prompt" in ntb
+
+        for group_start, fork_tok, correct_abs_idx in fork_results:
+            orig_prompt = prompts[group_start]  # (prompt_len,)
+            # Strip left-padding to get actual prompt tokens
+            nonpad = (orig_prompt != pad_id).nonzero(as_tuple=True)[0]
+            prompt_start = int(nonpad[0].item()) if len(nonpad) > 0 else orig_prompt.size(0)
+            actual_prompt = orig_prompt[prompt_start:]
+
+            # Correct prefix: response tokens up to fork_tok (clamped to valid length)
+            resp = responses[correct_abs_idx]  # (response_len,)
+            valid_resp_len = int(batch.batch["response_mask"][correct_abs_idx].sum().item())
+            fork_tok_clamped = min(fork_tok, valid_resp_len)
+            correct_prefix = resp[:fork_tok_clamped]
+
+            extended_ids_list.append(torch.cat([actual_prompt, correct_prefix]))
+
+            reward_model_list.append(ntb["reward_model"][group_start])
+            data_source_list.append(ntb["data_source"][group_start])
+            if has_extra_info:
+                extra_info_list.append(ntb["extra_info"][group_start])
+            if has_raw_prompt:
+                raw_prompt_list.append(ntb["raw_prompt"][group_start])
+
+        # Left-pad all extended prompts to the same length
+        max_len = max(ep.size(0) for ep in extended_ids_list)
+        padded_ids, padded_masks = [], []
+        for ep in extended_ids_list:
+            pad_len = max_len - ep.size(0)
+            padded_ids.append(torch.cat([ep.new_full((pad_len,), pad_id), ep]))
+            padded_masks.append(torch.cat([ep.new_zeros(pad_len), ep.new_ones(ep.size(0))]))
+
+        input_ids = torch.stack(padded_ids)           # (num_forked, max_len)
+        attention_mask = torch.stack(padded_masks).long()  # (num_forked, max_len)
+
+        num_forked = len(fork_results)
+        ntb_proto = {
+            "reward_model": np.array(reward_model_list, dtype=object),
+            "data_source": np.array(data_source_list, dtype=object),
+            "uid": np.array([str(uuid.uuid4()) for _ in range(num_forked)], dtype=object),
+            "multi_modal_inputs": np.array([{} for _ in range(num_forked)], dtype=object),
+            # Pre-tokenized extended prompt ids: used by single_turn_agent_loop to bypass chat template.
+            # Stored as object array of 1-D int32 numpy arrays (ragged lengths ok).
+            "prompt_token_ids": np.array(
+                [ep.cpu().to(torch.int32).numpy() for ep in extended_ids_list], dtype=object
+            ),
+        }
+        if has_extra_info:
+            ntb_proto["extra_info"] = np.array(extra_info_list, dtype=object)
+        # raw_prompt is required by _agent_loop_postprocess for bookkeeping; copy from Phase 1.
+        if has_raw_prompt:
+            ntb_proto["raw_prompt"] = np.array(raw_prompt_list, dtype=object)
+        else:
+            ntb_proto["raw_prompt"] = np.array([[] for _ in range(num_forked)], dtype=object)
+
+        fork2_gen = DataProto.from_single_dict(
+            data={"input_ids": input_ids, "attention_mask": attention_mask},
+        )
+        fork2_gen.non_tensor_batch = ntb_proto
+        fork2_gen.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+        fork2_gen = fork2_gen.repeat(repeat_times=n_rollouts, interleave=True)
+        return fork2_gen
+
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+        batch.meta_info["n_rollouts"] = rollout_config.n
         # update actor
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -1311,6 +1476,13 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
+        # filter_groups (DAPO dynamic sampling) accumulators — persist across
+        # generation passes within a single training step.
+        _fg_accum_batch: Optional[DataProto] = None
+        _fg_num_prompt: int = 0
+        _fg_num_gen_batches: int = 0
+        _filter_groups_cfg = self.config.algorithm.get("filter_groups", None)
+
         prev_step_profile = False
         curr_step_profile = (
             self.global_steps in self.config.global_profiler.steps
@@ -1344,6 +1516,7 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
@@ -1419,6 +1592,83 @@ class RayPPOTrainer:
                             batch = batch.union(batch_reward)
 
                         # extract reward_tensor and reward_extra_infos_dict for training
+                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                    # ---- filter_groups: DAPO dynamic sampling ----
+                    # Accumulate generation batches, discarding all-correct / all-wrong
+                    # prompt groups (std(metric) == 0), until we have enough prompts for
+                    # one gradient step.  Mirrors the reference implementation from
+                    # "Beyond the 80/20 Rule" (Wang et al., arXiv 2506.01939).
+                    if _filter_groups_cfg is not None and _filter_groups_cfg.enable:
+                        _fg_num_gen_batches += 1
+                        metric_name = _filter_groups_cfg.metric
+
+                        # Resolve per-trajectory metric values
+                        _reward_extra = reward_extra_infos_dict or {}
+                        if metric_name in _reward_extra:
+                            _metric_vals = np.asarray(_reward_extra[metric_name], dtype=np.float32)
+                        elif metric_name in batch.non_tensor_batch:
+                            _metric_vals = np.asarray(batch.non_tensor_batch[metric_name], dtype=np.float32)
+                        else:
+                            raise ValueError(
+                                f"filter_groups metric '{metric_name}' not found. "
+                                f"Available reward keys: {list(_reward_extra.keys())}"
+                            )
+
+                        _uids = batch.non_tensor_batch["uid"]
+
+                        # Group metric values by prompt uid
+                        _uid2vals: dict = defaultdict(list)
+                        for _uid, _mv in zip(_uids, _metric_vals):
+                            _uid2vals[_uid].append(float(_mv))
+
+                        # Keep prompts that have at least one correct AND one wrong response
+                        _kept_uids = {
+                            _uid for _uid, _vals in _uid2vals.items()
+                            if np.std(_vals) > 0 or len(_vals) == 1
+                        }
+                        _fg_num_prompt += len(_kept_uids)
+
+                        _kept_idxs = [_i for _i, _uid in enumerate(_uids) if _uid in _kept_uids]
+                        if _kept_idxs:
+                            _new_batch = batch[_kept_idxs]
+                            # global_token_num varies per generation pass; remove it so
+                            # DataProto.concat doesn't raise an assertion error.
+                            _new_batch.meta_info.pop("global_token_num", None)
+                            if _fg_accum_batch is not None:
+                                _fg_accum_batch.meta_info.pop("global_token_num", None)
+                            _fg_accum_batch = (
+                                _new_batch if _fg_accum_batch is None
+                                else DataProto.concat([_fg_accum_batch, _new_batch])
+                            )
+
+                        _prompt_bsz = self.config.data.train_batch_size
+                        if _fg_num_prompt < _prompt_bsz:
+                            _max_gen = getattr(_filter_groups_cfg, "max_num_gen_batches", 0)
+                            if _max_gen <= 0 or _fg_num_gen_batches < _max_gen:
+                                # Clear stale prefix-cache KV blocks before the next
+                                # generation pass.  With enable_prefix_caching=True,
+                                # completed requests leave blocks indexed in the cache;
+                                # the next generate() call can collide with them and
+                                # trigger a CUDA error in flash_attn's builder.build().
+                                # Clearing here costs one cache warm-up on re-runs
+                                # (rare) while keeping prefix caching for all normal steps.
+                                self.async_rollout_manager.clear_kv_cache()
+                                continue
+                            else:
+                                raise ValueError(
+                                    f"filter_groups: exhausted max_num_gen_batches={_max_gen} "
+                                    f"with only {_fg_num_prompt}/{_prompt_bsz} valid prompts. "
+                                    f"Increase max_num_gen_batches or check your reward function."
+                                )
+
+                        # Enough prompts: truncate to target trajectory count and proceed
+                        _traj_bsz = _prompt_bsz * self.config.actor_rollout_ref.rollout.n
+                        batch = _fg_accum_batch[:_traj_bsz]
+                        batch.meta_info["global_token_num"] = torch.sum(
+                            batch.batch["attention_mask"], dim=-1
+                        ).tolist()
+                        # Re-extract reward for the final accumulated+truncated batch
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
                     # Operating Mode Selection:
@@ -1529,6 +1779,238 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
+                        # Walk-weighted advantage reweighting (W-GRPO)
+                        fork2_batch = None   # populated by v8 hard fork if enabled
+                        no_contrast_frac = 1.0  # updated by differential walk if enabled
+                        n_rollouts = self.config.actor_rollout_ref.rollout.n
+                        if self.config.algorithm.get("use_walk_weighted_advantage", False):
+                            with marked_timer("walk_scores", timing_raw, color="purple"):
+                                walk_output = self._compute_walk_scores(batch)
+                                batch = batch.union(walk_output)
+                            walk_alpha = self.config.algorithm.get("walk_alpha", 1.0)
+
+                            # v6: differential walk — replace per-rollout absolute hub
+                            # scores with reward-contrastive scores (delta between
+                            # above-avg and below-avg reward rollouts of same prompt).
+                            if self.config.algorithm.get("walk_differential", False):
+                                n_rollouts = self.config.actor_rollout_ref.rollout.n
+                                wi_diff, no_contrast_frac = compute_differential_walk(
+                                    walk_importance=batch.batch["walk_importance"],
+                                    token_level_scores=batch.batch["token_level_scores"],
+                                    response_mask=batch.batch["response_mask"],
+                                    n=n_rollouts,
+                                )
+                                batch.batch["walk_importance"] = wi_diff
+                                metrics["walk/differential_no_contrast_frac"] = no_contrast_frac
+
+                            # v10: group-normalized walk — z-score walk scores across
+                            # rollouts at each token position, analogous to GRPO's
+                            # per-group advantage normalization. No ReLU; below-mean
+                            # walk tokens are dampened, above-mean amplified.
+                            # Differential signal emerges naturally: at positions where
+                            # correct rollouts attend more, they get positive z-scores.
+                            elif self.config.algorithm.get("walk_group_norm", False):
+                                n_rollouts = self.config.actor_rollout_ref.rollout.n
+                                wi_gnorm = compute_group_normalized_walk(
+                                    walk_importance=batch.batch["walk_importance"],
+                                    response_mask=batch.batch["response_mask"],
+                                    n=n_rollouts,
+                                )
+                                batch.batch["walk_importance"] = wi_gnorm
+
+                            # v7: fork-block gradient concentration — amplify the
+                            # structural decision point identified by differential walk.
+                            if self.config.algorithm.get("walk_fork_boost", False):
+                                n_rollouts = self.config.actor_rollout_ref.rollout.n
+                                fork_boost = self.config.algorithm.get("walk_fork_boost_factor", 2.0)
+                                fork_k = self.config.algorithm.get("walk_fork_k", 1)
+                                block_size = self.config.actor_rollout_ref.actor.get(
+                                    "walk_importance", {}
+                                ).get("block_size", 32)
+                                wi_fork, mean_fork_block = compute_fork_amplification(
+                                    delta_walk=batch.batch["walk_importance"],
+                                    response_mask=batch.batch["response_mask"],
+                                    block_size=block_size,
+                                    n=n_rollouts,
+                                    fork_boost=fork_boost,
+                                    fork_k=fork_k,
+                                )
+                                batch.batch["walk_importance"] = wi_fork
+                                metrics["walk/mean_fork_block"] = mean_fork_block
+
+                            # Log walk importance stats before applying
+                            wi = batch.batch["walk_importance"]
+                            rm = batch.batch["response_mask"].bool()
+                            adv = batch.batch["advantages"]
+                            wi_active = wi[rm]
+                            adv_active = adv[rm]
+                            metrics["walk/importance_mean"] = wi_active.mean().item()
+                            metrics["walk/importance_std"] = wi_active.std().item()
+                            metrics["walk/importance_max"] = wi_active.max().item()
+                            metrics["walk/importance_min"] = wi_active.min().item()
+                            # Log top-k tokens by walk score for a sample sequence
+                            responses = batch.batch["responses"]  # (B, response_length)
+                            for sample_idx in range(min(2, wi.size(0))):
+                                row_mask = rm[sample_idx]
+                                valid_len = int(row_mask.sum().item())
+                                if valid_len == 0:
+                                    continue
+                                scores_valid = wi[sample_idx, :valid_len]
+                                ids_valid = responses[sample_idx, :valid_len]
+                                k = min(8, valid_len)
+                                topk_vals, topk_idx = scores_valid.topk(k)
+                                order = topk_vals.argsort(descending=True)
+                                parts = []
+                                for pos, score in zip(topk_idx[order].tolist(), topk_vals[order].tolist()):
+                                    tok_str = self.tokenizer.decode([ids_valid[pos].item()])
+                                    parts.append(f"{repr(tok_str)}@{pos}={score:.3f}")
+                                print(f"[walk top-tokens] step={self.global_steps} seq={sample_idx} top8: {', '.join(parts)}")
+                            # Fraction of tokens with non-zero advantage (walk actually matters here)
+                            nonzero_adv = (adv_active.abs() > 1e-8)
+                            metrics["walk/nonzero_adv_frac"] = nonzero_adv.float().mean().item()
+                            walk_pure_reward = self.config.algorithm.get("walk_pure_reward", False)
+                            if nonzero_adv.any():
+                                metrics["walk/importance_mean_nonzero_adv"] = wi_active[nonzero_adv].mean().item()
+                                # Print raw vs walk-weighted advantage for first few non-zero tokens
+                                nz_idx = nonzero_adv.nonzero(as_tuple=True)[0][:8]
+                                for idx in nz_idx:
+                                    if walk_pure_reward:
+                                        w_adv = adv_active[idx].item() * wi_active[idx].item()
+                                    else:
+                                        w_adv = adv_active[idx].item() * (1 + walk_alpha * wi_active[idx].item())
+                                    print(f"[walk adv] raw={adv_active[idx].item():.4f} walk={wi_active[idx].item():.3f} weighted={w_adv:.4f}")
+
+                            # v11: walk as direct advantage gate (no additive baseline)
+                            # v1-v10: (1 + alpha * walk) additive reweighting
+                            if walk_pure_reward:
+                                batch.batch["advantages"] = apply_walk_pure_advantage(
+                                    advantages=adv,
+                                    walk_importance=wi,
+                                    response_mask=batch.batch["response_mask"],
+                                )
+                            else:
+                                batch.batch["advantages"] = apply_walk_weighted_advantage(
+                                    advantages=adv,
+                                    walk_importance=wi,
+                                    response_mask=batch.batch["response_mask"],
+                                    alpha=walk_alpha,
+                                )
+
+                            # Log weighted advantage stats
+                            adv_w = batch.batch["advantages"][rm]
+                            metrics["walk/weighted_adv_mean"] = adv_w.mean().item()
+                            metrics["walk/weighted_adv_std"] = adv_w.std().item()
+
+                            # v8: Hard fork — Phase 2 generation conditioned on correct prefix
+                            # Only runs when differential walk has contrast signal (no_contrast_frac < 1)
+                            if self.config.algorithm.get("walk_hard_fork", False) and no_contrast_frac < 1.0:
+                                block_size_hf = self.config.actor_rollout_ref.actor.get(
+                                    "walk_importance", {}
+                                ).get("block_size", 32)
+                                fork_k_hf = self.config.algorithm.get("walk_fork_k", 1)
+                                fork_results = find_hard_fork_positions(
+                                    walk_importance=batch.batch["walk_importance"],
+                                    token_level_scores=batch.batch["token_level_scores"],
+                                    response_mask=batch.batch["response_mask"],
+                                    n=n_rollouts,
+                                    block_size=block_size_hf,
+                                    fork_k=fork_k_hf,
+                                )
+                                metrics["walk/hard_fork_groups"] = len(fork_results)
+
+                                if fork_results:
+                                    fork2_gen_batch = self._build_fork2_gen_batch(batch, fork_results, n_rollouts)
+
+                                    with marked_timer("gen_fork2", timing_raw, color="orange"):
+                                        fork2_output = self.async_rollout_manager.generate_sequences(fork2_gen_batch)
+
+                                    fork2_batch = fork2_output
+                                    fork2_batch.batch["response_mask"] = compute_response_mask(fork2_batch)
+
+                                    # Compute old log probs for Phase 2
+                                    fork2_old_lp, _ = self._compute_old_log_prob(fork2_batch)
+                                    fork2_old_lp.batch.pop("entropys", None)
+                                    fork2_batch = fork2_batch.union(fork2_old_lp)
+
+                                    # Compute ref log probs for Phase 2
+                                    if self.use_reference_policy:
+                                        fork2_ref_lp = self._compute_ref_log_prob(fork2_batch)
+                                        fork2_batch = fork2_batch.union(fork2_ref_lp)
+
+                                    # Extract reward (populated by agent loop during generation)
+                                    fork2_reward_tensor, fork2_reward_extra = extract_reward(fork2_batch)
+                                    fork2_batch.batch["token_level_scores"] = fork2_reward_tensor
+                                    if self.config.algorithm.use_kl_in_reward:
+                                        fork2_batch, _ = apply_kl_penalty(
+                                            fork2_batch,
+                                            kl_ctrl=self.kl_ctrl_in_reward,
+                                            kl_penalty=self.config.algorithm.kl_penalty,
+                                        )
+                                    else:
+                                        fork2_batch.batch["token_level_rewards"] = fork2_reward_tensor
+
+                                    # Compute advantages for Phase 2 independently (separate GRPO groups)
+                                    fork2_batch = compute_advantage(
+                                        fork2_batch,
+                                        adv_estimator=self.config.algorithm.adv_estimator,
+                                        gamma=self.config.algorithm.gamma,
+                                        lam=self.config.algorithm.lam,
+                                        num_repeat=n_rollouts,
+                                        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                        config=self.config.algorithm,
+                                    )
+
+                                    p2_score = fork2_batch.batch["token_level_scores"].sum(-1).mean().item()
+                                    metrics["walk/hard_fork_p2_score_mean"] = p2_score
+
+                        # ----------------------------------------------------------------
+                        # PIVOT: temporal walk change scores + advantage gating
+                        # ----------------------------------------------------------------
+                        if self.config.algorithm.get("use_pivot", False):
+                            pivot_version = self.config.algorithm.get("pivot_version", 1)
+                            with marked_timer("pivot_scores", timing_raw, color="teal"):
+                                if pivot_version == 2:
+                                    pivot_output = self._compute_fork_scores_v2(batch)
+                                else:
+                                    pivot_output = self._compute_pivot_scores(batch)
+                                batch = batch.union(pivot_output)
+
+                            pivot_mode = self.config.algorithm.get("pivot_mode", "soft")
+                            pivot_alpha = self.config.algorithm.get("pivot_alpha", 1.0)
+                            pivot_threshold = self.config.algorithm.get("pivot_threshold", 0.3)
+
+                            ps = batch.batch["pivot_scores"]
+                            rm_bool = batch.batch["response_mask"].bool()
+                            ps_active = ps[rm_bool]
+                            metrics["pivot/score_mean"] = ps_active.mean().item()
+                            metrics["pivot/score_std"] = ps_active.std().item()
+                            metrics["pivot/frac_above_threshold"] = (
+                                (ps_active > pivot_threshold).float().mean().item()
+                            )
+
+                            batch.batch["advantages"] = apply_pivot_advantage(
+                                advantages=batch.batch["advantages"],
+                                pivot_scores=ps,
+                                response_mask=batch.batch["response_mask"],
+                                mode=pivot_mode,
+                                threshold=pivot_threshold,
+                                alpha=pivot_alpha,
+                            )
+
+                            adv_p = batch.batch["advantages"][rm_bool]
+                            metrics["pivot/weighted_adv_mean"] = adv_p.mean().item()
+                            metrics["pivot/weighted_adv_std"] = adv_p.std().item()
+
+                            # v2: save batch-averaged fork profile for Phase 2 trigger
+                            if pivot_version == 2:
+                                profile_path = self.config.algorithm.get(
+                                    "pivot_fork_profile_path",
+                                    "/tmp/pivot_v2_fork_profile.npy",
+                                )
+                                self._save_fork_profile(
+                                    ps, batch.batch["response_mask"], profile_path
+                                )
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
@@ -1538,9 +2020,14 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
+                        # update actor (Phase 1)
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
+
+                        # update actor (Phase 2 hard fork), if generated
+                        if fork2_batch is not None:
+                            with marked_timer("update_actor_fork2", timing_raw, color="red"):
+                                self._update_actor(fork2_batch)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -1575,6 +2062,8 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+                    self._print_sample_rollouts(batch)
 
                 # validate
                 if self.config.trainer.test_freq > 0 and (
@@ -1635,8 +2124,18 @@ class RayPPOTrainer:
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
+                # Report how many generation passes this step required
+                if _filter_groups_cfg is not None and _filter_groups_cfg.enable:
+                    metrics["train/num_gen_batches"] = _fg_num_gen_batches
+
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+
+                # Reset filter_groups accumulators for the next training step
+                if _filter_groups_cfg is not None and _filter_groups_cfg.enable:
+                    _fg_accum_batch = None
+                    _fg_num_prompt = 0
+                    _fg_num_gen_batches = 0
 
                 progress_bar.update(1)
                 self.global_steps += 1

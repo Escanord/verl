@@ -1170,6 +1170,113 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="actor_compute_walk_scores")
+    def compute_walk_scores(self, data: DataProto):
+        """Compute walk-based token importance scores for W-GRPO advantage reweighting."""
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+
+        with self.ulysses_sharding_manager:
+            outputs = self.actor.compute_walk_scores(data=data)
+            output = DataProto.from_dict(tensors={"walk_importance": outputs["walk_importance"]})
+
+        output = output.to("cpu")
+
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="actor_compute_pivot_scores")
+    def compute_pivot_scores(self, data: DataProto):
+        """Compute PIVOT temporal walk change scores for loss gating."""
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+
+        with self.ulysses_sharding_manager:
+            outputs = self.actor.compute_pivot_scores(data=data)
+            output = DataProto.from_dict(tensors={"pivot_scores": outputs["pivot_scores"]})
+
+        output = output.to("cpu")
+
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="actor_compute_fork_scores_v2")
+    def compute_fork_scores_v2(self, data: DataProto):
+        """Compute PIVOT-v2 representation divergence fork scores for loss gating."""
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+        data.meta_info["n_rollouts_per_prompt"] = self.config.rollout.n
+
+        with self.ulysses_sharding_manager:
+            outputs = self.actor.compute_fork_scores_v2(data=data)
+            output = DataProto.from_dict(tensors={"pivot_scores": outputs["pivot_scores"]})
+
+        output = output.to("cpu")
+
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="orange", role="actor_generate_with_langevin")
+    def generate_with_langevin(self, data: DataProto):
+        """PIVOT Langevin rollout: token-by-token generation with walk-triggered deliberation."""
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        with self.ulysses_sharding_manager:
+            outputs = self.actor.generate_with_langevin(data=data)
+            output = DataProto.from_dict(tensors={
+                "responses": outputs["responses"],
+                "p_causal_mask": outputs["p_causal_mask"],
+            })
+
+        output = output.to("cpu")
+
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
         if self._is_lora:

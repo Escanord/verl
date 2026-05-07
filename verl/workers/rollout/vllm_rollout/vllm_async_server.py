@@ -122,6 +122,8 @@ class vLLMHttpServer:
         self.nnodes = nnodes
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+        # Manager proxy to cross-process trigger registry (set in run_server).
+        self._shared_trig = None
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -225,7 +227,8 @@ class vLLMHttpServer:
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
             compilation_config = json.loads(compilation_config)
-        compilation_config.setdefault("cudagraph_mode", "FULL_AND_PIECEWISE")
+        _default_cgmode = os.environ.get("VERL_VLLM_CUDAGRAPH_MODE", "FULL_AND_PIECEWISE")
+        compilation_config.setdefault("cudagraph_mode", _default_cgmode)
 
         # FULL cuda graph is not yet supported with DCP, downgrade to PIECEWISE
         dcp_size = engine_kwargs.get("decode_context_parallel_size", 1) or 1
@@ -264,6 +267,15 @@ class vLLMHttpServer:
             "compilation_config": compilation_config,
             **engine_kwargs,
         }
+
+        # Disable cascade attention when requested via env var.
+        # Cascade attention is an optimization on top of prefix caching that processes the
+        # shared prefix and per-request suffixes separately via two attention calls. It can
+        # cause CUDA illegal memory access errors under certain conditions (FA2/FA3 +
+        # PIECEWISE cudagraph + high prefix reuse). Setting this disables the cascade path
+        # while keeping KV prefix caching active (blocks are still stored and reused).
+        if os.environ.get("VERL_VLLM_DISABLE_CASCADE_ATTN", "0") in ("1", "true", "True"):
+            args["disable-cascade-attn"] = True
 
         # update profiler args
         profiler_args = build_vllm_profiler_args(
@@ -382,6 +394,59 @@ class vLLMHttpServer:
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
 
+        # build_cli_args_from_config silently drops False booleans, so vLLM never
+        # receives --no-enable-prefix-caching and defaults to True. Patch directly.
+        if not self.config.enable_prefix_caching:
+            vllm_config.cache_config.enable_prefix_caching = False
+
+        # Same issue: verl's enable_sleep_mode defaults to True but vLLM's ModelConfig
+        # defaults to False. build_cli_args_from_config drops False, so --enable-sleep-mode
+        # is only added when True. When the user sets False, patch directly.
+        vllm_config.model_config.enable_sleep_mode = self.config.enable_sleep_mode
+
+        # Register PIVOTv2LangevinAdapter as engine-level logits processor when
+        # pivot v2 Langevin rollout is enabled. Must happen before engine creation
+        # so the config is inherited by spawned worker subprocesses via env var.
+        pivot_cfg = getattr(self.config, "pivot", {}) or {}
+        if pivot_cfg.get("pivot_version", 0) == 2 and pivot_cfg.get("langevin_rollout", False):
+            if pivot_cfg.get("lan_use_cuda_graph", False):
+                from verl.utils.vllm.pivot_patch import PIVOTv18bLangevinAdapter, set_langevin_cfg
+                set_langevin_cfg(dict(pivot_cfg))
+                vllm_config.model_config.logits_processors = [PIVOTv18bLangevinAdapter]
+            else:
+                from verl.utils.vllm.pivot_patch import PIVOTv2LangevinAdapter, set_langevin_cfg
+                set_langevin_cfg(dict(pivot_cfg))
+                vllm_config.model_config.logits_processors = [PIVOTv2LangevinAdapter]
+
+            # Wire up cross-process trigger registry BEFORE engine spawn.
+            # PIVOTv2LangevinAdapter.update_state() runs in the vLLM EngineCore
+            # subprocess and writes trigger masks to _TRIGGER_REGISTRY there.
+            # That in-process dict is invisible to this (HTTP server) process.
+            # Fix: start a Manager, expose a shared dict, encode its address in
+            # _PIVOT_TRIG_REGISTRY_ADDR so the EngineCore subprocess connects to
+            # it on startup and writes there instead.  self._shared_trig is the
+            # same proxy object that generate_sequences() reads from.
+            import json as _json, os as _os
+            from multiprocessing.managers import BaseManager, MakeProxyType
+            _exposed = ("update", "pop", "get", "__len__", "__contains__", "__setitem__")
+            _TrigMgrCls = type("_TrigMgrCls", (BaseManager,), {})
+            # Force TCP so the address is always (host, port) — not a Unix socket path.
+            _TrigMgrCls.register("get_registry", dict, MakeProxyType("DictProxy", _exposed))
+            self._shared_trig_manager = _TrigMgrCls()
+            self._shared_trig_manager.start()
+            self._shared_trig = self._shared_trig_manager.get_registry()
+            _tok = self._shared_trig._token
+            _addr = _tok.address  # str (Unix socket) or (host, port) tuple
+            _addr_ser = list(_addr) if isinstance(_addr, tuple) else _addr
+            _os.environ["_PIVOT_TRIG_REGISTRY_ADDR"] = _json.dumps({
+                "address": _addr_ser,
+                "proxy_id": _tok.id,
+                "exposed": list(_exposed),
+                "authkey": self._shared_trig_manager._authkey.decode("latin-1"),
+            })
+            logger.info("PIVOT-v2: registered PIVOTv2LangevinAdapter as vLLM logits processor; "
+                        "trigger registry Manager at %s", _addr)
+
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
         kwargs = {}
         if "enable_log_requests" in fn_args:
@@ -485,6 +550,13 @@ class vLLMHttpServer:
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        # Embed request_id so the logits processor can use it as a stable
+        # registry key (avoids the token_ids key that was only available at
+        # step N+1 via update_state(), causing a race with generate()'s pop).
+        if self._shared_trig is not None:
+            if sampling_params.extra_args is None:
+                sampling_params.extra_args = {}
+            sampling_params.extra_args["_pivot_req_id"] = request_id
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
@@ -525,6 +597,41 @@ class vLLMHttpServer:
             result_dict=extra_fields,
         )
         token_ids = final_res.outputs[0].token_ids
+
+        # PIVOT: collect per-trigger delta entries written by _flush_trigger_registry()
+        # in apply() during rollout. Each trigger writes one compound key:
+        #   (request_id, trig_idx) -> (step, dv, topk_ids, topk_lps)
+        # By the time generate() receives the final RequestOutput, all apply() calls
+        # have completed, so all chunks are guaranteed to be in the registry.
+        try:
+            _shared_trig = self._shared_trig
+            if _shared_trig is not None:
+                _n_tok = len(token_ids)
+                _mask = [0.0] * _n_tok
+                _lp_list = [0.0] * _n_tok
+                _n_chunks = 0
+                while True:
+                    _chunk = _shared_trig.pop((request_id, _n_chunks), None)
+                    if _chunk is None:
+                        break
+                    _step, _dv, _ids, _lps = _chunk
+                    if _step < _n_tok:
+                        _mask[_step] = _dv
+                        _tok = token_ids[_step]
+                        _lp_list[_step] = _lps[_ids.index(_tok)] if _tok in _ids else -20.0
+                    _n_chunks += 1
+                if _n_chunks > 0:
+                    extra_fields["lan_trigger_mask"] = _mask
+                    extra_fields["lan_log_p_lan"] = _lp_list
+            # When Langevin is configured but no trigger fired for this sample
+            # (e.g. response shorter than langevin_min_trigger_position), set
+            # absent keys to None so all samples in the batch have uniform keys.
+            # dp_actor.py already handles per-sample None values gracefully.
+            extra_fields.setdefault("lan_trigger_mask", None)
+            extra_fields.setdefault("lan_log_p_lan", None)
+        except Exception:
+            pass
+
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
@@ -604,6 +711,14 @@ class vLLMHttpServer:
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
+        # Signal PIVOTv2LangevinAdapter (running in EngineCore subprocess) to
+        # reset its per-step entropy buffer and save the calibrated threshold.
+        # This fires once per training step, before the rollout batch starts.
+        if self._shared_trig is not None:
+            try:
+                self._shared_trig["_pivot_reset"] = True
+            except Exception:
+                pass
 
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()

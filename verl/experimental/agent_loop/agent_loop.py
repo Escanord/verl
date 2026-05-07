@@ -517,6 +517,7 @@ class AgentLoopWorker:
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
 
+
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
             default_agent_loop = config.agent.default_agent_loop
@@ -810,16 +811,22 @@ class AgentLoopWorker:
         enable_async_reward = self.reward_loop_worker_handles is not None
 
         if output.reward_score is None and enable_async_reward:
-            batch = TensorDict(
-                {
-                    "prompts": prompts,  # [1, prompt_length]
-                    "responses": responses,  # [1, response_length]
-                    "attention_mask": attention_mask,  # [1, prompt_length + response_length]
-                    "input_ids": input_ids,  # [1, prompt_length + response_length]
-                    "position_ids": position_ids,
-                },
-                batch_size=1,
-            )
+            batch_dict = {
+                "prompts": prompts,  # [1, prompt_length]
+                "responses": responses,  # [1, response_length]
+                "attention_mask": attention_mask,  # [1, prompt_length + response_length]
+                "input_ids": input_ids,  # [1, prompt_length + response_length]
+                "position_ids": position_ids,
+            }
+            # Pass rollout-time per-token log-probs into the reward manager so a
+            # custom reward function can surface entropy diagnostics as val
+            # metrics.  Only present when calculate_log_probs is enabled.
+            if output.response_logprobs is not None:
+                pad_size = self.rollout_config.response_length - len(output.response_logprobs)
+                batch_dict["rollout_log_probs"] = torch.tensor(
+                    output.response_logprobs + [0.0] * pad_size
+                ).unsqueeze(0)
+            batch = TensorDict(batch_dict, batch_size=1)
             non_tensor_batch = {
                 **{k: np.array([v]) for k, v in kwargs.items()},
                 "__num_turns__": np.array([output.num_turns]),

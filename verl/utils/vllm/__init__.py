@@ -20,6 +20,8 @@ from .utils import TensorLoRARequest, VLLMHijack, is_version_ge
 # wait until you actually start using it before importing the contents of
 # patch.py separately.
 
+# pivot_patch is also deferred — import after vLLM model is created.
+
 __all__ = [
     "TensorLoRARequest",
     "VLLMHijack",

@@ -115,6 +115,12 @@ class ActorConfig(BaseConfig):
         loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.
             If None, uses response_length. Set to a constant to ensure consistent normalization.
         entropy_coeff (float): Entropy coefficient for regularization.
+        entropy_top_ratio (Optional[float]): Fraction of top-entropy tokens to train on (High-Ent RL).
+            When set (e.g. 0.2), only the top ``entropy_top_ratio`` fraction of response tokens
+            by per-token entropy from the current policy are included in the policy-gradient loss.
+            Low-entropy "routine" tokens are masked out. ``None`` disables this filter (default).
+            Reference: "Beyond the 80/20 Rule: High-Entropy Minority Tokens Drive Effective RL
+            for LLM Reasoning" (Wang et al., NeurIPS 2025, https://arxiv.org/abs/2506.01939).
         tau_pos (float): Positive tau for SAPO smoothing (>= 1.0 keeps rewards stable).
         tau_neg (float): Negative tau for SAPO smoothing (> tau_pos for asymmetry).
         use_kl_loss (bool): Whether to use KL divergence loss.
@@ -156,6 +162,8 @@ class ActorConfig(BaseConfig):
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None
     entropy_coeff: float = 0
+    entropy_loss_cap: float = 0.0
+    entropy_top_ratio: Optional[float] = None
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False
@@ -300,6 +308,12 @@ class FSDPActorConfig(ActorConfig):
     use_rollout_log_probs: bool = False
     calculate_sum_pi_squared: bool = False
     sum_pi_squared_checkpointing: bool = False
+    walk_importance: dict = field(default_factory=dict)
+    # PIVOT config: temporal walk change scores + Langevin generation
+    # Phase 1 (loss gating) keys: block_size, norm_mode
+    # Phase 2 (vLLM Langevin rollout) keys: langevin_rollout (bool),
+    #   langevin_threshold, langevin_K, langevin_eta, langevin_sigma
+    pivot: dict = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""

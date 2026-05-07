@@ -262,6 +262,11 @@ class RolloutConfig(BaseConfig):
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
+    # PIVOT Phase 2 (Langevin rollout via vLLM logits processor).
+    # Keys: langevin_rollout (bool), langevin_threshold, langevin_K,
+    #       langevin_eta, langevin_sigma, block_size
+    pivot: dict = field(default_factory=dict)
+
     qat: Optional[dict] = None
 
     def __post_init__(self):

@@ -81,6 +81,16 @@ class NaiveRewardManager(AbstractRewardManager):
             rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
             extra_info["num_turns"] = num_turns
             extra_info["rollout_reward_scores"] = rollout_reward_scores
+            # Surface per-rollout diagnostics so a custom reward function can
+            # bubble them up as val metrics (response_length, entropy proxy).
+            extra_info["response_length"] = int(valid_response_length)
+            if "rollout_log_probs" in data_item.batch:
+                _lp = data_item.batch["rollout_log_probs"]
+                _vrl = int(valid_response_length)
+                if _vrl > 0:
+                    extra_info["entropy"] = float(-_lp[:_vrl].mean().item())
+                else:
+                    extra_info["entropy"] = 0.0
 
             score = self.compute_score(
                 data_source=data_source,

@@ -11,6 +11,17 @@ actually produces *as a group*).  We report two metrics per prompt:
     1. Token-level Levenshtein distance, normalized by max-length pair.
     2. 1 - Jaccard similarity over token sets.
 
+To distinguish "useful" diversity from "all-wrong" diversity, each rollout is
+scored with the math_dapo verifier against the parquet's ground_truth, and we
+additionally report:
+
+    - correct_only_*: pairwise diversity AMONG correct rollouts (groups with
+      <2 correct rollouts contribute no pairs to this aggregate)
+    - mixed_correctness_fraction: fraction of n-rollout groups that contain
+      both a correct and an incorrect rollout (the GRPO-relevant signal:
+      these are the groups with non-zero within-group reward variance)
+    - solve_rate: per-prompt mean correctness across the n rollouts
+
 Run once per checkpoint (GRPO/HEG/DRIFT).  Compare per-prompt diversity
 distributions side-by-side to defend §3.2's "the diffusion term spreads the n
 rollouts into distinct continuations" claim.
@@ -58,6 +69,8 @@ import datasets
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
+from verl.utils.reward_score import math_dapo
+
 
 def levenshtein(a, b):
     """Iterative Levenshtein on token lists.  O(len(a)*len(b)); fine for our sizes."""
@@ -104,12 +117,14 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.ckpt, trust_remote_code=True)
     prompts = []
+    ground_truths = []
     for ex in ds:
         msgs = ex["prompt"]
         if tokenizer.chat_template:
             prompts.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
         else:
             prompts.append(msgs[0]["content"])
+        ground_truths.append(ex["reward_model"]["ground_truth"])
 
     print(f"[diversity] loading vLLM (tp={args.tp})", file=sys.stderr)
     llm = LLM(
@@ -134,32 +149,74 @@ def main():
     per_prompt = []
     all_lev = []
     all_jac = []
+    all_lev_correct = []
+    all_jac_correct = []
+    n_mixed = 0
+    n_groups_with_pairs = 0
     for i, out in enumerate(outputs):
         # Token IDs per sample (from vLLM's RequestOutput)
         token_seqs = [list(s.token_ids) for s in out.outputs]
+        # Decoded text + math_dapo correctness per rollout
+        texts = [s.text for s in out.outputs]
+        gt = ground_truths[i]
+        scores = []
+        for txt in texts:
+            try:
+                r = math_dapo.compute_score(txt, gt)
+                # math_dapo returns dict with 'score' or 'acc'; both are 0/1 here
+                acc = r.get("acc", r.get("score", 0))
+                scores.append(int(acc == 1 or acc == 1.0))
+            except Exception:
+                scores.append(0)
+        n_correct = sum(scores)
+        solve_rate = n_correct / max(len(scores), 1)
+        if 0 < n_correct < len(scores):
+            n_mixed += 1
+
         lev_norm_pairs = []
         jac_dist_pairs = []
-        for a, b in combinations(token_seqs, 2):
+        lev_norm_correct_pairs = []
+        jac_dist_correct_pairs = []
+        for (idx_a, a), (idx_b, b) in combinations(enumerate(token_seqs), 2):
             lv = levenshtein(a, b)
             denom = max(len(a), len(b), 1)
-            lev_norm_pairs.append(lv / denom)
+            lv_n = lv / denom
             sa, sb = set(a), set(b)
             inter = len(sa & sb)
             union = len(sa | sb) or 1
-            jac_dist_pairs.append(1.0 - inter / union)
+            jc = 1.0 - inter / union
+            lev_norm_pairs.append(lv_n)
+            jac_dist_pairs.append(jc)
+            if scores[idx_a] == 1 and scores[idx_b] == 1:
+                lev_norm_correct_pairs.append(lv_n)
+                jac_dist_correct_pairs.append(jc)
+        if lev_norm_pairs:
+            n_groups_with_pairs += 1
+
         per_prompt.append(
             {
                 "idx": i,
                 "n_pairs": len(lev_norm_pairs),
+                "n_correct": n_correct,
+                "solve_rate": solve_rate,
+                "scores": scores,
                 "lev_norm_pairs": lev_norm_pairs,
                 "jaccard_dist_pairs": jac_dist_pairs,
+                "lev_norm_correct_pairs": lev_norm_correct_pairs,
+                "jaccard_dist_correct_pairs": jac_dist_correct_pairs,
                 "mean_lev_norm": statistics.mean(lev_norm_pairs) if lev_norm_pairs else 0.0,
                 "mean_jaccard_dist": statistics.mean(jac_dist_pairs) if jac_dist_pairs else 0.0,
+                "mean_lev_norm_correct": (statistics.mean(lev_norm_correct_pairs)
+                                          if lev_norm_correct_pairs else None),
+                "mean_jaccard_dist_correct": (statistics.mean(jac_dist_correct_pairs)
+                                              if jac_dist_correct_pairs else None),
                 "response_lens": [len(s) for s in token_seqs],
             }
         )
         all_lev.extend(lev_norm_pairs)
         all_jac.extend(jac_dist_pairs)
+        all_lev_correct.extend(lev_norm_correct_pairs)
+        all_jac_correct.extend(jac_dist_correct_pairs)
 
     def _summary(xs):
         if not xs:
@@ -173,14 +230,24 @@ def main():
             "n": len(xs),
         }
 
+    solve_rates = [pp["solve_rate"] for pp in per_prompt]
     summary = {
         "lev_norm": _summary(all_lev),
         "jaccard_dist": _summary(all_jac),
+        "lev_norm_correct": _summary(all_lev_correct),
+        "jaccard_dist_correct": _summary(all_jac_correct),
+        "solve_rate": _summary(solve_rates),
+        "mixed_correctness_fraction": (n_mixed / n_groups_with_pairs) if n_groups_with_pairs else 0.0,
+        "n_groups_with_pairs": n_groups_with_pairs,
+        "n_mixed_groups": n_mixed,
+        "n_correct_pairs": len(all_lev_correct),
     }
     print(
         f"[diversity] {args.tag}  "
-        f"lev_norm.mean={summary['lev_norm']['mean']:.4f}  "
-        f"jaccard.mean={summary['jaccard_dist']['mean']:.4f}",
+        f"lev.all={summary['lev_norm']['mean']:.4f} ({summary['lev_norm']['n']} pairs)  "
+        f"lev.correct={summary['lev_norm_correct']['mean']:.4f} ({summary['lev_norm_correct']['n']} pairs)  "
+        f"mixed_frac={summary['mixed_correctness_fraction']:.4f}  "
+        f"solve={summary['solve_rate']['mean']:.4f}",
         file=sys.stderr,
     )
 

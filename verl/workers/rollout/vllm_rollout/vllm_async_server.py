@@ -409,13 +409,34 @@ class vLLMHttpServer:
         # so the config is inherited by spawned worker subprocesses via env var.
         pivot_cfg = getattr(self.config, "pivot", {}) or {}
         if pivot_cfg.get("pivot_version", 0) == 2 and pivot_cfg.get("langevin_rollout", False):
-            if pivot_cfg.get("lan_use_cuda_graph", False):
+            # v19: if langevin_mask_eos is on and no eos ids were supplied, load
+            # the tokenizer in this (parent) process to compute them — the env-var
+            # cfg can't carry a tokenizer across the spawn boundary.
+            _mut_pivot_cfg = dict(pivot_cfg)
+            if _mut_pivot_cfg.get("langevin_mask_eos", False) and not _mut_pivot_cfg.get("langevin_eos_token_ids"):
+                try:
+                    from transformers import AutoTokenizer
+                    from verl.utils.vllm.pivot_patch import _identify_eos_class_tokens
+                    _tok = AutoTokenizer.from_pretrained(
+                        vllm_config.model_config.tokenizer,
+                        trust_remote_code=True,
+                    )
+                    _eos_ids = _identify_eos_class_tokens(_tok)
+                    _mut_pivot_cfg["langevin_eos_token_ids"] = list(_eos_ids)
+                    logger.info("PIVOT v19: pre-computed eos token ids = %s", _eos_ids)
+                except Exception as _e:
+                    logger.warning(
+                        "PIVOT v19: failed to pre-compute eos token ids: %s; "
+                        "mask will be a no-op.", _e,
+                    )
+
+            if _mut_pivot_cfg.get("lan_use_cuda_graph", False):
                 from verl.utils.vllm.pivot_patch import PIVOTv18bLangevinAdapter, set_langevin_cfg
-                set_langevin_cfg(dict(pivot_cfg))
+                set_langevin_cfg(_mut_pivot_cfg)
                 vllm_config.model_config.logits_processors = [PIVOTv18bLangevinAdapter]
             else:
                 from verl.utils.vllm.pivot_patch import PIVOTv2LangevinAdapter, set_langevin_cfg
-                set_langevin_cfg(dict(pivot_cfg))
+                set_langevin_cfg(_mut_pivot_cfg)
                 vllm_config.model_config.logits_processors = [PIVOTv2LangevinAdapter]
 
             # Wire up cross-process trigger registry BEFORE engine spawn.

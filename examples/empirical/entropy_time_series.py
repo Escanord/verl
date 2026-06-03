@@ -57,6 +57,12 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+try:
+    from verl.utils.reward_score import math_dapo
+    _HAS_MATH_DAPO = True
+except ImportError:
+    _HAS_MATH_DAPO = False
+
 
 def shannon_entropy(logits):
     """H of softmax(logits) in nats.  Logits: (V,)."""
@@ -108,6 +114,7 @@ def rollout(
     seed,
     buf_size=2000,
     warmup_threshold=0.4,
+    feedback_sign="maintenance",
 ):
     """Generate a single rollout with optional Langevin perturbation, logging
     full per-token entropy and the trigger mask."""
@@ -155,10 +162,13 @@ def rollout(
             if H_first is None:
                 H_first = H_t
 
-            # Update G with the previous trigger's eps using the
-            # entropy-maintenance feedback signal s = H_t - alpha_target * H_first
+            # Update G with the previous trigger's eps. The maintenance signal
+            #   s = H_t - alpha_target * H_first
+            # rewards perturbations that keep branch-point entropy near the
+            # per-trajectory anchor; the reduction signal is its negation.
             if eps_prev is not None:
-                signal = H_t - alpha_target * H_first
+                base_signal = H_t - alpha_target * H_first
+                signal = base_signal if feedback_sign == "maintenance" else -base_signal
                 G = gamma * G + (1.0 - gamma) * signal * eps_prev
 
             # Mix learned drift with sphere exploration
@@ -214,6 +224,26 @@ def main():
     p.add_argument("--alpha_target", type=float, default=0.7)
     p.add_argument("--gamma", type=float, default=0.7, help="drift Polyak momentum")
     p.add_argument("--alpha", type=float, default=0.6, help="drift exploit ratio")
+    p.add_argument(
+        "--feedback_sign",
+        choices=["maintenance", "reduction"],
+        default="maintenance",
+        help="SPSA feedback orientation: 'maintenance' uses s = H_t - alpha_target*H_first; "
+             "'reduction' uses the negation (defends §3.3.2 by ablation).",
+    )
+    p.add_argument(
+        "--n_rollouts",
+        type=int,
+        default=1,
+        help="Number of rollouts per (prompt, condition). When > 1, enables group-level "
+             "ablation analysis (mixed_correctness_fraction, n correct pairs).",
+    )
+    p.add_argument(
+        "--score",
+        action="store_true",
+        help="Score each rollout against the parquet's reward_model.ground_truth using "
+             "math_dapo. Required for the group-level mixed-correctness metric.",
+    )
     # Misc
     p.add_argument("--tag", required=True)
     p.add_argument("--out_dir", default="./entropy_out")
@@ -235,6 +265,10 @@ def main():
     ds = datasets.Dataset.from_parquet(args.prompts)
     ds = ds.select(range(min(args.n_prompts, len(ds))))
 
+    if args.score and not _HAS_MATH_DAPO:
+        print("[entropy_ts] --score requested but math_dapo unavailable", file=sys.stderr)
+        sys.exit(1)
+
     with open(out_path, "w") as f:
         for i, ex in enumerate(ds):
             msgs = ex["prompt"]
@@ -242,34 +276,54 @@ def main():
                 prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
             else:
                 prompt = msgs[0]["content"]
+            gt = ex.get("reward_model", {}).get("ground_truth") if args.score else None
 
             for cond in ("vanilla", "drift"):
                 use_langevin = cond == "drift"
-                print(f"[entropy_ts] prompt {i}  cond={cond}", file=sys.stderr)
-                result = rollout(
-                    model,
-                    tokenizer,
-                    prompt,
-                    max_new_tokens=args.max_new_tokens,
-                    K=args.K,
-                    eta=args.langevin_eta,
-                    sigma=args.langevin_sigma,
-                    p_quantile=args.p_quantile,
-                    t_min=args.t_min,
-                    alpha_target=args.alpha_target,
-                    gamma=args.gamma,
-                    alpha=args.alpha,
-                    use_langevin=use_langevin,
-                    seed=args.seed + i,
-                )
-                rec = {
-                    "tag": args.tag,
-                    "prompt_idx": i,
-                    "condition": cond,
-                    **result,
-                }
-                f.write(json.dumps(rec) + "\n")
-                f.flush()
+                for r_idx in range(args.n_rollouts):
+                    print(
+                        f"[entropy_ts] prompt {i}  cond={cond}  rollout {r_idx}",
+                        file=sys.stderr,
+                    )
+                    seed = args.seed + i * 1000 + r_idx
+                    result = rollout(
+                        model,
+                        tokenizer,
+                        prompt,
+                        max_new_tokens=args.max_new_tokens,
+                        K=args.K,
+                        eta=args.langevin_eta,
+                        sigma=args.langevin_sigma,
+                        p_quantile=args.p_quantile,
+                        t_min=args.t_min,
+                        alpha_target=args.alpha_target,
+                        gamma=args.gamma,
+                        alpha=args.alpha,
+                        use_langevin=use_langevin,
+                        seed=seed,
+                        feedback_sign=args.feedback_sign,
+                    )
+                    score = None
+                    if args.score and gt is not None:
+                        try:
+                            txt = tokenizer.decode(result["tokens"], skip_special_tokens=True)
+                            sr = math_dapo.compute_score(txt, gt)
+                            acc = sr.get("acc", sr.get("score", 0))
+                            score = int(acc == 1 or acc == 1.0)
+                        except Exception as e:
+                            print(f"[entropy_ts] score error: {e}", file=sys.stderr)
+                            score = 0
+                    rec = {
+                        "tag": args.tag,
+                        "prompt_idx": i,
+                        "condition": cond,
+                        "rollout_idx": r_idx,
+                        "seed": seed,
+                        "score": score,
+                        **result,
+                    }
+                    f.write(json.dumps(rec) + "\n")
+                    f.flush()
 
     print(f"[entropy_ts] wrote {out_path}", file=sys.stderr)
 

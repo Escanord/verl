@@ -96,6 +96,63 @@ def _reset_pivot_state():
 # Langevin helper (shared with dp_actor.py logic)
 # ---------------------------------------------------------------------------
 
+
+def _identify_eos_class_tokens(tokenizer) -> List[int]:
+    """Tokens whose generation terminates a response.
+
+    Union of (i) tokenizer.eos_token_id(s) and (ii) common chat-end markers that
+    happen to tokenize to a single token id.  Used to mask EOS-class tokens out
+    of the Langevin top-K subspace so perturbations cannot push toward early
+    response termination (the §3.4 length-collapse pathway).
+    """
+    out: set = set()
+    if tokenizer is None:
+        return []
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is not None:
+        try:
+            out.add(int(eos))
+        except (TypeError, ValueError):
+            pass
+    # Some tokenizers expose multiple eos ids; the attribute may be either
+    # a list/tuple/iterable, a single int, or absent entirely.
+    eos_ids = getattr(tokenizer, "eos_token_ids", None)
+    if eos_ids is not None:
+        if isinstance(eos_ids, int):
+            out.add(int(eos_ids))
+        else:
+            try:
+                for t in eos_ids:
+                    try:
+                        out.add(int(t))
+                    except (TypeError, ValueError):
+                        pass
+            except TypeError:
+                pass  # not iterable, not int — give up silently
+    # Chat-template end markers — only include when they map to a single token.
+    for marker in ("<|im_end|>", "<|endoftext|>", "<|end|>", "<|eos|>"):
+        try:
+            ids = tokenizer.encode(marker, add_special_tokens=False)
+            if isinstance(ids, list) and len(ids) == 1:
+                out.add(int(ids[0]))
+        except Exception:
+            pass
+    return sorted(out)
+
+
+def _apply_eos_mask_(logits: torch.Tensor, eos_ids_tensor: Optional[torch.Tensor]) -> torch.Tensor:
+    """Set EOS-class token logits to -inf in-place.  No-op if eos_ids_tensor is None.
+
+    Accepts any logits shape ending in the vocab axis; eos_ids_tensor is a 1-D
+    long tensor of token ids to mask.
+    """
+    if eos_ids_tensor is None or eos_ids_tensor.numel() == 0:
+        return logits
+    eos_dev = eos_ids_tensor.to(logits.device)
+    logits.index_fill_(-1, eos_dev, float("-inf"))
+    return logits
+
+
 def _langevin_step(logits: torch.Tensor, eta: float, sigma: float) -> torch.Tensor:
     """One step of entropy-gradient Langevin: logits += eta*∇H + N(0,σ²).
     Preserves -inf masks so top-k constraints are respected across steps.
@@ -110,13 +167,26 @@ def _langevin_step(logits: torch.Tensor, eta: float, sigma: float) -> torch.Tens
     return noisy.to(logits.dtype)
 
 
-def _langevin_sample(logits: torch.Tensor, K: int, eta: float, sigma: float, top_k: int = 0) -> torch.Tensor:
+def _langevin_sample(
+    logits: torch.Tensor,
+    K: int,
+    eta: float,
+    sigma: float,
+    top_k: int = 0,
+    eos_ids_tensor: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Apply K Langevin steps, optionally constrained to top-k tokens.
 
     top_k=0 means no constraint (full vocabulary).
     top_k>0 masks all but the top-k tokens to -inf before stepping,
     preventing Langevin from activating incoherent low-rank tokens.
+
+    eos_ids_tensor (optional): token ids masked to -inf BEFORE top-k selection,
+    so the perturbation subspace can never include EOS-class tokens.
     """
+    if eos_ids_tensor is not None and eos_ids_tensor.numel() > 0:
+        logits = logits.clone()
+        _apply_eos_mask_(logits, eos_ids_tensor)
     if top_k > 0:
         safe_logits = logits.float().nan_to_num(nan=float('-inf'))
         topk_vals, topk_idx = torch.topk(safe_logits, min(top_k, logits.size(-1)))
@@ -177,6 +247,7 @@ def _langevin_step_feedback(
     top_k: int,
     G: Optional[torch.Tensor],
     alpha: float,
+    eos_ids_tensor: Optional[torch.Tensor] = None,
 ) -> tuple:
     """Langevin step with G-guided adaptive noise. No entropy-gradient drift.
 
@@ -188,7 +259,13 @@ def _langevin_step_feedback(
 
     Returns (new_logits, eps_full_vocab) where eps_full_vocab is saved by the
     caller so that G can be updated at the next step using the observed entropy.
+
+    eos_ids_tensor (optional): EOS-class token ids masked to -inf BEFORE top-K
+    selection, so the perturbation subspace excludes response-terminating tokens.
     """
+    if eos_ids_tensor is not None and eos_ids_tensor.numel() > 0:
+        logits = logits.clone()
+        _apply_eos_mask_(logits, eos_ids_tensor)
     if top_k > 0:
         safe_logits = logits.float().nan_to_num(nan=float('-inf'))
         topk_vals, topk_idx = torch.topk(safe_logits, min(top_k, logits.size(-1)))
@@ -232,12 +309,19 @@ def _langevin_step_feedback_batched(
     top_k: int,
     G: torch.Tensor,       # (N, vocab) — zeros where G is absent
     alpha: float,
+    eos_ids_tensor: Optional[torch.Tensor] = None,
 ) -> tuple:
     """Batched version of _langevin_step_feedback for N triggered sequences.
 
     Single randn call over (N, vocab) instead of N separate calls — better GPU
     utilization via larger kernels and fewer launch overheads.
+
+    eos_ids_tensor (optional): EOS-class token ids masked to -inf BEFORE top-K
+    selection.  See _langevin_step_feedback for rationale.
     """
+    if eos_ids_tensor is not None and eos_ids_tensor.numel() > 0:
+        logits = logits.clone()
+        _apply_eos_mask_(logits, eos_ids_tensor)
     if top_k > 0:
         safe_logits = logits.float().nan_to_num(nan=float('-inf'))
         topk_vals, topk_idx = torch.topk(safe_logits, min(top_k, logits.shape[-1]), dim=-1)
@@ -888,6 +972,7 @@ class PIVOTv2RolloutProcessor:
         langevin_feedback: bool = False,
         langevin_exploit_ratio: float = 0.5,
         langevin_alpha_target: float = 0.0,
+        langevin_eos_ids_tensor: Optional[torch.Tensor] = None,
     ):
         self.delta_var_threshold = delta_var_threshold
         self.entropy_threshold = entropy_threshold
@@ -905,6 +990,9 @@ class PIVOTv2RolloutProcessor:
         self.langevin_feedback = langevin_feedback
         self.langevin_exploit_ratio = langevin_exploit_ratio  # α: G-direction fraction in ε
         self.langevin_alpha_target = langevin_alpha_target    # v18: 0 = off, >0 = H_first*alpha target
+        # v19: EOS-class token ids masked from the Langevin top-K subspace.
+        # None / empty = mask off (legacy behavior).
+        self.langevin_eos_ids_tensor = langevin_eos_ids_tensor
 
         # Set by PIVOTv2LangevinAdapter.apply() before each __call__
         self._delta_var_current: float = 0.0
@@ -1151,7 +1239,8 @@ class PIVOTv2RolloutProcessor:
             else:
                 with torch.no_grad():
                     logits, _eps = _langevin_step_feedback(
-                        logits, self.sigma, self.top_k, self._G, self.langevin_exploit_ratio
+                        logits, self.sigma, self.top_k, self._G, self.langevin_exploit_ratio,
+                        eos_ids_tensor=self.langevin_eos_ids_tensor,
                     )
             self._prev_eps = _eps  # keep on GPU alongside _G
             self._fb_triggered = True
@@ -1219,7 +1308,10 @@ class PIVOTv2RolloutProcessor:
                     else:
                         logits, self._velocity = result
             else:
-                logits = _langevin_sample(logits, self.K, self.eta, self.sigma, top_k=self.top_k)
+                logits = _langevin_sample(
+                    logits, self.K, self.eta, self.sigma, top_k=self.top_k,
+                    eos_ids_tensor=self.langevin_eos_ids_tensor,
+                )
 
         with torch.no_grad():
             p_after = torch.softmax(logits.float(), dim=-1)
@@ -1280,6 +1372,31 @@ try:
                 self._pivot_cfg = dict(_LANGEVIN_CFG)
             self._sample_logged: bool = False
             self._tokenizer = self._pivot_cfg.get("tokenizer", None)
+            # v19: EOS-class token mask for Langevin top-K subspace.
+            # Token ids are computed in the parent process (where the tokenizer
+            # lives) and serialised through the env-var cfg as a list of ints;
+            # we just rebuild the tensor here.  Shared by reference across all
+            # per-request processors; never modified.
+            self._eos_ids_tensor: Optional[torch.Tensor] = None
+            if self._pivot_cfg.get("langevin_mask_eos", False):
+                _eos_ids = self._pivot_cfg.get("langevin_eos_token_ids", [])
+                if not _eos_ids and self._tokenizer is not None:
+                    # Fallback: derive from tokenizer if the parent process didn't
+                    # pre-compute (e.g. unit-test paths that set cfg directly).
+                    _eos_ids = _identify_eos_class_tokens(self._tokenizer)
+                if _eos_ids:
+                    self._eos_ids_tensor = torch.tensor(
+                        [int(t) for t in _eos_ids], dtype=torch.long,
+                    )
+                    logger.info(
+                        "PIVOT v19: EOS-class mask enabled with %d token ids: %s",
+                        len(_eos_ids), list(self._eos_ids_tensor.tolist()),
+                    )
+                else:
+                    logger.warning(
+                        "PIVOT v19: langevin_mask_eos=True but no eos token ids available; "
+                        "mask will be a no-op.",
+                    )
             # Aggregate stats
             self._agg_H_before: list = []
             self._agg_H_after: list = []
@@ -1290,6 +1407,10 @@ try:
             self._agg_mala_accepted: int = 0
             self._agg_mala_total: int = 0
             self._agg_fb_signals: list = []  # feedback signal values across all requests
+            # v19: rolling response-length buffer for adaptive t_min.
+            # Appended in update_state() when each request completes; consumed in
+            # new_req_logits_processor() to derive a quantile-based trigger floor.
+            self._agg_response_lengths: list = []
             # Cross-process trigger registry via Manager IPC.
             # VllmHttpServer pickles self._shared_trig (the DictProxy pointing
             # to dict_A in the Manager server) into _PIVOT_TRIG_REGISTRY_PROXY.
@@ -1396,6 +1517,74 @@ try:
                     computed_dv_threshold = fixed_dv_threshold
                 computed_ent_threshold = fixed_ent_threshold
 
+            # Adaptive t_min modes:
+            #   "static"   (or unset): use the static langevin_min_trigger_position.
+            #   "adaptive" (v19):      t_min = clamp(median(lengths) - W_min, floor, cap).
+            #   "peak"     (v20):      t_min = clamp(alpha * historic_peak, floor, cap),
+            #                          where historic_peak is a *monotonic* high-water
+            #                          mark of median rollout length.  Once Langevin
+            #                          self-disables due to length compression (collapse
+            #                          onset), the peak preserves the disable: t_min stays
+            #                          at alpha * peak_before_collapse, above any post-
+            #                          collapse length.  Re-engages automatically if/when
+            #                          the policy recovers and length climbs back over
+            #                          t_min.  Replicates the manual "pump t_min up at
+            #                          collapse onset" intervention that rescued v18b 1.7B.
+            _t_min_static = int(self._pivot_cfg.get("langevin_min_trigger_position", 0))
+            _t_min_mode = str(self._pivot_cfg.get("langevin_min_trigger_position_mode", "static")).lower()
+            if _t_min_mode == "adaptive":
+                _t_min_window = int(self._pivot_cfg.get("langevin_t_min_window", 400))
+                _t_min_floor = int(self._pivot_cfg.get("langevin_t_min_floor", 400))
+                _t_min_cap = int(self._pivot_cfg.get("langevin_t_min_cap", 2500))
+                # Need at least ~64 completed rollouts for a stable median.
+                # Below that, fall back to the static floor.
+                if len(self._agg_response_lengths) >= 64:
+                    _buf = sorted(self._agg_response_lengths[-2000:])
+                    _median = int(_buf[len(_buf) // 2])
+                    _t_min_computed = _median - _t_min_window
+                    _t_min_effective = max(_t_min_floor, min(_t_min_computed, _t_min_cap))
+                    if not getattr(self, "_adaptive_tmin_logged", False):
+                        self._adaptive_tmin_logged = True
+                        print(
+                            f"PIVOT v19 adaptive t_min activated: "
+                            f"median={_median} W_min={_t_min_window} -> t_min={_t_min_effective} "
+                            f"(floor={_t_min_floor}, cap={_t_min_cap}, "
+                            f"buf={len(self._agg_response_lengths)})",
+                            flush=True,
+                        )
+                else:
+                    _t_min_effective = _t_min_floor
+            elif _t_min_mode == "peak":
+                _alpha = float(self._pivot_cfg.get("langevin_peak_alpha", 0.6))
+                _t_min_floor = int(self._pivot_cfg.get("langevin_t_min_floor", 200))
+                _t_min_cap = int(self._pivot_cfg.get("langevin_t_min_cap", 3200))
+                # Need ~64 completed rollouts before the peak is meaningful.
+                if len(self._agg_response_lengths) >= 64:
+                    _buf = sorted(self._agg_response_lengths[-2000:])
+                    _median = int(_buf[len(_buf) // 2])
+                    # Monotonic peak: only goes up, never down.  Once Langevin
+                    # has fired on a long rollout regime, the peak preserves that
+                    # information so any subsequent length collapse disables Langevin.
+                    _prev_peak = getattr(self, "_peak_length", _t_min_floor)
+                    self._peak_length = max(_prev_peak, _median)
+                    _t_min_computed = int(_alpha * self._peak_length)
+                    _t_min_effective = max(_t_min_floor, min(_t_min_computed, _t_min_cap))
+                    # Log significant peak updates (first activation + each new peak).
+                    if self._peak_length > _prev_peak + 50 or not getattr(self, "_peak_tmin_logged", False):
+                        self._peak_tmin_logged = True
+                        print(
+                            f"PIVOT v20 peak t_min: "
+                            f"median={_median} peak={self._peak_length} alpha={_alpha} "
+                            f"-> t_min={_t_min_effective} "
+                            f"(floor={_t_min_floor}, cap={_t_min_cap}, "
+                            f"buf={len(self._agg_response_lengths)})",
+                            flush=True,
+                        )
+                else:
+                    _t_min_effective = _t_min_floor
+            else:
+                _t_min_effective = _t_min_static
+
             return PIVOTv2RolloutProcessor(
                 delta_var_threshold=computed_dv_threshold,
                 entropy_threshold=computed_ent_threshold,
@@ -1409,10 +1598,11 @@ try:
                 langevin_momentum=float(self._pivot_cfg.get("langevin_momentum", 0.0)),
                 langevin_momentum_beta2=float(self._pivot_cfg.get("langevin_momentum_beta2", 0.0)),
                 langevin_mala=bool(self._pivot_cfg.get("langevin_mala", False)),
-                langevin_min_trigger_position=int(self._pivot_cfg.get("langevin_min_trigger_position", 0)),
+                langevin_min_trigger_position=_t_min_effective,
                 langevin_feedback=bool(self._pivot_cfg.get("langevin_feedback", False)),
                 langevin_exploit_ratio=float(self._pivot_cfg.get("langevin_exploit_ratio", 0.5)),
                 langevin_alpha_target=float(self._pivot_cfg.get("langevin_alpha_target", 0.0)),
+                langevin_eos_ids_tensor=self._eos_ids_tensor,
             )
 
         def is_argmax_invariant(self) -> bool:
@@ -1552,9 +1742,13 @@ try:
                                 _G_stack[_j] = _proc._G.to(logits.device)
 
                         # One batched Langevin call for all N_trig sequences.
+                        # All procs in the same batch share the same EOS mask tensor
+                        # (built once per adapter instance from the tokenizer).
+                        _eos_ids = getattr(_proc0, "langevin_eos_ids_tensor", None)
                         with torch.no_grad():
                             _new_trig_logits, _eps_batch = _langevin_step_feedback_batched(
-                                _trig_logits, _sigma, _top_k, _G_stack, _exploit
+                                _trig_logits, _sigma, _top_k, _G_stack, _exploit,
+                                eos_ids_tensor=_eos_ids,
                             )
 
                         # Scatter first, inject eps second.  If scatter fails
@@ -1682,6 +1876,11 @@ try:
                         continue
                     trigger_frac = n_triggers / n_steps
                     self._agg_trigger_fracs.append(trigger_frac)
+                    # v19: response-length buffer for adaptive t_min.
+                    # Cap retention at the most recent 4000 to bound memory.
+                    self._agg_response_lengths.append(n_steps)
+                    if len(self._agg_response_lengths) > 4000:
+                        self._agg_response_lengths = self._agg_response_lengths[-2000:]
                     self._agg_n_completed += 1
                     self._agg_H_before.extend(proc._entropy_before)
                     # _entropy_after may contain GPU tensors (deferred from decode).

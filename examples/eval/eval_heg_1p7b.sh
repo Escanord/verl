@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Evaluate HEG (high-entropy GRPO) baseline on Qwen3-1.7B-Base.
+# Evaluate High-Entropy GRPO on Qwen3-1.7B-Base.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

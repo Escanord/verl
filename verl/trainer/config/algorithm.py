@@ -604,6 +604,16 @@ class AlgoConfig(BaseConfig):
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
     use_kl_in_reward: bool = False
+    # DRIFT-v22: how to inject KL into the reward when use_kl_in_reward=True.
+    # - "token"        : default — subtract β·KL_t from each token. Per-rollout
+    #                    sum becomes β·Σ_t KL_t, which scales with length and
+    #                    biases GRPO toward short rollouts (the bug we hit in v21).
+    # - "rollout_mean" : v22 — subtract β·mean_t(KL_t) per rollout (uniformly
+    #                    distributed across the rollout's response tokens).
+    #                    Short shortcut rollouts (high per-token KL) get heavily
+    #                    penalised; long natural rollouts (low per-token KL) get
+    #                    minimal penalty.
+    kl_in_reward_mode: str = "token"
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)
     use_pf_ppo: bool = False

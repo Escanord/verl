@@ -15,7 +15,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-DIVERSITY_OUT="${DIVERSITY_OUT:-/storage/workspace/server-1/duy/checkpoints/verl/diversity_out}"
+DIVERSITY_OUT="${DIVERSITY_OUT:-/storage/workspace/server-1/duy/checkpoints/verl/empirical}"
 PROMPTS="${PROMPTS:-/storage/workspace/server-1/duy/data/guru_rl/test_aime.parquet}"
 N_PROMPTS="${N_PROMPTS:-30}"
 N="${N:-8}"
@@ -30,9 +30,9 @@ RUNS=(
     "grpo_4b_step60|/storage/workspace/server-1/duy/checkpoints/verl/grpo/qwen3_4b_base/global_step_60/actor/hf_merged"
     "heg_4b_step60|/storage/workspace/server-1/duy/checkpoints/verl/high-ent-grpo/qwen3_4b_base/global_step_60/actor/hf_merged"
     "v18c_4b_step60|/storage/workspace/server-1/duy/checkpoints/verl/pivot-v18c/qwen3_4b_base/global_step_60/actor/hf_merged"
-    "grpo_1p7b_step100|/storage/workspace/server-1/duy/checkpoints/verl/grpo/qwen3_1p7b_base/global_step_100/actor/hf_merged"
-    "heg_1p7b_step100|/storage/workspace/server-1/duy/checkpoints/verl/high-ent-grpo/qwen3_1p7b_base/global_step_100/actor/hf_merged"
-    "v18b_1p7b_step100|/storage/workspace/server-1/duy/checkpoints/verl/pivot-v18b/qwen3_1p7b_base/global_step_100/actor/hf_merged"
+    "grpo_1p7b_step160|/storage/workspace/server-1/duy/checkpoints/verl/grpo/qwen3_1p7b_base/global_step_160/actor/hf_merged"
+    "heg_1p7b_step160|/storage/workspace/server-1/duy/checkpoints/verl/high-ent-grpo/qwen3_1p7b_base/global_step_160/actor/hf_merged"
+    "v18b_1p7b_step160|/storage/workspace/server-1/duy/checkpoints/verl/pivot-v18b/qwen3_1p7b_base/global_step_160/actor/hf_merged"
 )
 
 source /storage/workspace/server-1/duy/venv-vault/miniconda3/etc/profile.d/conda.sh

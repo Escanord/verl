@@ -1414,6 +1414,25 @@ class DataParallelPPOActor(BasePPOActor):
         # v18: asymmetric IS — negative-advantage trigger positions use min(log_p_lan, log_π_old)
         # as denominator so wrong committed paths are penalised at full GRPO strength.
         _lan_grpo_asym_is = bool(_pivot_cfg_train.get("lan_grpo_asym_is", False))
+        # v21: soft IS correction as a per-token loss multiplier.
+        # Replaces the denominator patch entirely: PPO ratio stays π_θ/π_old (trust
+        # region intact), and the off-policy correction is applied by reweighting
+        # advantages at trigger positions by w = min(1, π_old/π_lan_old).
+        # Equivalent to multiplying per-token pg_loss by w because pg = -A·ratio.
+        # When True, all of (correct_is, denom_blend, asym_is, direct_coeff,
+        # is_addon_coeff) are ignored at trigger positions.
+        _lan_grpo_soft_is = bool(_pivot_cfg_train.get("lan_grpo_soft_is", False))
+
+        # v21 IS-weight accumulators (rank-local, emitted once at the end of
+        # update_policy so each rank contributes a single scalar per metric and
+        # the gathered list across DP ranks is flat — avoids the ragged list-of-
+        # lists that np.mean can't handle when micro-batch counts differ per rank).
+        _v21_w_sum: float = 0.0
+        _v21_w_sq_sum: float = 0.0
+        _v21_w_min: float = float("inf")
+        _v21_log_w_sum: float = 0.0
+        _v21_n_trig_total: int = 0
+        _v21_samples: list[float] = []  # for percentile estimation
 
         metrics = {
             "actor/pg_loss": 0.0,
@@ -1488,11 +1507,41 @@ class DataParallelPPOActor(BasePPOActor):
                     _direct_old_log_prob = None
                     if "lan_grpo_mask" in outputs and _lan_grpo_coeff_train > 0.0 and _lan_grpo_is_addon_coeff == 0.0:
                         _lg_mask = outputs["lan_grpo_mask"].float()
-                        if _lan_grpo_direct_coeff > 0.0:
+                        if _lan_grpo_soft_is:
+                            # v21: soft IS multiplier. PPO ratio stays π_θ/π_old; the
+                            # off-policy correction is applied as a per-token weight
+                            # w = min(1, π_old/π_lan_old) at trigger positions, by
+                            # reweighting advantages (pg = -A·ratio → multiplying A is
+                            # equivalent to multiplying pg).
+                            _log_p_lan = outputs["lan_grpo_log_p"]
+                            _log_pi_old = old_log_prob.detach()
+                            _log_w_v21 = (_log_pi_old - _log_p_lan).clamp(max=0.0)
+                            _w_corr_v21 = torch.exp(_log_w_v21)
+                            _is_weight_v21 = (1.0 - _lg_mask) + _w_corr_v21 * _lg_mask
+                            advantages = advantages * _is_weight_v21
+                            # Accumulate IS-weight stats into rank-local scalars;
+                            # emit once at the end of update_policy so the gathered
+                            # per-rank metric is a flat 8-element list (not ragged
+                            # 8×N_micro_batches that np.mean can't reduce when N
+                            # differs per rank — e.g. due to overlong-prompt drops).
+                            _trig_bool = _lg_mask.bool()
+                            if _trig_bool.any():
+                                _w_trig = _w_corr_v21[_trig_bool].float()
+                                _log_w_trig = _log_w_v21[_trig_bool].float()
+                                _v21_w_sum += _w_trig.sum().item()
+                                _v21_log_w_sum += _log_w_trig.sum().item()
+                                _v21_n_trig_total += int(_w_trig.numel())
+                                _v21_w_min = min(_v21_w_min, float(_w_trig.min().item()))
+                                # Reservoir-ish: cap at 4096 samples to bound memory.
+                                if len(_v21_samples) < 4096:
+                                    _v21_samples.extend(_w_trig.detach().cpu().tolist())
+                            # v21 disables the legacy IS-denominator patch; fall through
+                            # to standard PPO loss with the reweighted advantages.
+                        elif _lan_grpo_direct_coeff > 0.0:
                             # v15: save pre-patch old_log_prob (= log π_old).
                             # Used for direct term: adv*(log π_current - log π_old) at triggers.
                             _direct_old_log_prob = old_log_prob.detach()
-                        if _lan_grpo_correct_is:
+                        if not _lan_grpo_soft_is and _lan_grpo_correct_is:
                             # v13 correct IS: patch denominator (frozen) with log p_lan_approx.
                             # adv*(log π_current - log p_lan_approx) at trigger positions.
                             # Gradient flows only through log π_current (numerator).
@@ -1694,5 +1743,28 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+        # v21: emit IS-weight summary once per update_policy call (per rank).
+        # Each rank contributes a single scalar per metric → gathered list across
+        # DP ranks is flat → np.mean reduces cleanly regardless of per-rank
+        # micro-batch count variation.
+        if _lan_grpo_soft_is:
+            if _v21_n_trig_total > 0:
+                _v21_w_mean = _v21_w_sum / _v21_n_trig_total
+                _v21_log_w_mean = _v21_log_w_sum / _v21_n_trig_total
+                _v21_samples.sort()
+                _v21_p10 = _v21_samples[max(0, int(len(_v21_samples) * 0.1) - 1)]
+            else:
+                _v21_w_mean = 1.0
+                _v21_log_w_mean = 0.0
+                _v21_w_min = 1.0
+                _v21_p10 = 1.0
+            v21_metrics = {
+                "pivot/v21_w_corr_mean": _v21_w_mean,
+                "pivot/v21_w_corr_min": _v21_w_min,
+                "pivot/v21_w_corr_p10": _v21_p10,
+                "pivot/v21_log_w_mean": _v21_log_w_mean,
+                "pivot/v21_trig_count": _v21_n_trig_total,
+            }
+            append_to_dict(metrics, v21_metrics)
         self.actor_optimizer.zero_grad()
         return metrics

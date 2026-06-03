@@ -84,6 +84,88 @@ from verl.workers.config import DistillationConfig, FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+def apply_rollout_mean_kl_penalty(
+    data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty: str = "kl"
+):
+    """DRIFT-v22: per-rollout mean-KL penalty applied to **correct rollouts only**.
+
+    Standard ``apply_kl_penalty`` does ``token_level_rewards = token_level_scores -
+    β · KL_t`` per token, which sums to ``r_correct − β · Σ_t KL_t`` per rollout.
+    Because Σ_t scales with length, short rollouts pay LESS total penalty than
+    long ones — biasing GRPO further toward length collapse.
+
+    This variant computes the per-rollout MEAN KL across response tokens and
+    distributes ``β · mean_KL_i`` uniformly across rollout i's response tokens
+    — but ONLY for rollouts that earned a positive reward (i.e., emitted a
+    correct answer in the expected format).  After GRPO's per-rollout reward
+    sum, the effective shaped reward is
+
+        r'_i  =  r_correct_i  −  β · mean_KL_per_token_i  ·  1{r_correct_i > 0}
+
+    Gating on the correctness mask is essential and matches the existing
+    ``length_penalty_coef`` pattern at ``core_algos.compute_grpo_outcome_advantage``.
+    Without this gate, KL-noise on wrong rollouts (which dominate early
+    training) creates spurious group variance: GRPO's ``(r − μ) / (σ + ε)``
+    normalization then amplifies microscopic KL perturbations (∼1e-3) up
+    to advantage magnitudes of ±2.5, producing a noise-driven gradient
+    that pushes the policy toward "minimise per-token KL from base" —
+    which on math prompts means "never commit to an answer tag, keep
+    generating natural-looking tokens until the length cap" (the v22
+    initial-implementation failure mode: length 1523 → 4000+, math
+    mean@16 0.12% → 0.00%, every short-producing capability extinguished
+    within 15 steps).
+
+    With the gate, all-wrong groups have all-zero KL penalty → no extra
+    variance → standard GRPO no-signal behaviour.  Only mixed-correctness
+    groups see the KL term, which there breaks the tie between
+    short-correct and long-correct in favour of long-correct.
+    """
+    response_mask = data.batch["response_mask"]
+    token_level_scores = data.batch["token_level_scores"]
+    batch_size = data.batch.batch_size[0]
+
+    kld = core_algos.kl_penalty(
+        data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
+    )  # (B, T)
+    kld = kld * response_mask
+    beta = kl_ctrl.value
+
+    n_response = response_mask.sum(dim=-1).clamp(min=1).float()  # (B,)
+    mean_kl_per_rollout = kld.sum(dim=-1) / n_response  # (B,) — mean KL per token
+
+    # Gate: only correct rollouts (score > 0) receive the KL penalty.
+    score_per_rollout = token_level_scores.sum(dim=-1)  # (B,)
+    correct_mask = (score_per_rollout > 0).float()  # (B,)
+
+    # Distribute β · mean_KL uniformly across this rollout's response tokens so
+    # the GRPO per-rollout sum subtracts exactly β · mean_KL for correct rollouts
+    # (0 for wrong rollouts).
+    penalty_per_token = (beta * mean_kl_per_rollout * correct_mask / n_response).unsqueeze(-1)  # (B, 1)
+    token_level_rewards = token_level_scores - penalty_per_token * response_mask
+
+    # KL controller update: feed batch mean of per-rollout mean KL across CORRECT
+    # rollouts only (matches the gradient signal we're actually injecting).  If no
+    # rollouts are correct this step, feed the unmasked mean as a fallback so the
+    # adaptive controller still tracks divergence.
+    if correct_mask.sum().item() > 0:
+        current_kl_for_ctrl = float((mean_kl_per_rollout * correct_mask).sum().item()
+                                    / max(int(correct_mask.sum().item()), 1))
+    else:
+        current_kl_for_ctrl = float(mean_kl_per_rollout.mean().item())
+    kl_ctrl.update(current_kl=current_kl_for_ctrl, n_steps=batch_size)
+    data.batch["token_level_rewards"] = token_level_rewards
+
+    metrics = {
+        "actor/reward_kl_penalty": current_kl_for_ctrl,
+        "actor/reward_kl_penalty_coeff": beta,
+        "actor/reward_kl_penalty_per_rollout_mean": float(mean_kl_per_rollout.mean().item()),
+        "actor/reward_kl_penalty_per_rollout_max": float(mean_kl_per_rollout.max().item()),
+        "actor/reward_kl_penalty_correct_count": int(correct_mask.sum().item()),
+        "actor/reward_kl_penalty_correct_mean_kl": current_kl_for_ctrl,
+    }
+    return data, metrics
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -1740,11 +1822,45 @@ class RayPPOTrainer:
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                        # Diagnostic: per-length-stratum reward distribution.
+                        # This lets us verify the v21-collapse hypothesis ("short-guess
+                        # outperforms long-reason at the model's current ability level")
+                        # in real time. If short_reward_mean > long_reward_mean during
+                        # the bootstrap window, GRPO will be incentivised to collapse.
+                        try:
+                            _rmask_diag = batch.batch["response_mask"]
+                            _scores_diag = batch.batch["token_level_scores"].sum(dim=-1)
+                            _lens_diag = _rmask_diag.sum(dim=-1).float()
+                            for _name, _lo, _hi in (
+                                ("short_lt200", 0.0, 200.0),
+                                ("mid_200_800", 200.0, 800.0),
+                                ("long_ge800", 800.0, float("inf")),
+                            ):
+                                _m = (_lens_diag >= _lo) & (_lens_diag < _hi)
+                                _cnt = int(_m.sum().item())
+                                metrics[f"diag/{_name}_count"] = _cnt
+                                if _cnt > 0:
+                                    metrics[f"diag/{_name}_reward_mean"] = float(_scores_diag[_m].mean().item())
+                                    metrics[f"diag/{_name}_reward_pos_frac"] = float((_scores_diag[_m] > 0).float().mean().item())
+                            del _rmask_diag, _scores_diag, _lens_diag
+                        except Exception:
+                            pass
+
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                            )
+                            _kl_mode = getattr(self.config.algorithm, "kl_in_reward_mode", "token")
+                            if _kl_mode == "rollout_mean":
+                                # DRIFT-v22: per-rollout mean KL applied uniformly across
+                                # rollout's response tokens. Sums to β·mean_KL per rollout,
+                                # which (unlike per-token KL → β·Σ_t KL) discriminates
+                                # against short-shortcut rollouts.
+                                batch, kl_metrics = apply_rollout_mean_kl_penalty(
+                                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                )
+                            else:
+                                batch, kl_metrics = apply_kl_penalty(
+                                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                )
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]

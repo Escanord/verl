@@ -31,7 +31,7 @@ MODEL="${MODEL:-/home/escanord/duy/checkpoints/models/Qwen3-1.7B-Base}"
 REWARD_FN="$(dirname "$0")/guru_rl_reward.py"
 
 train_files="$DATA_DIR/train.parquet"
-val_files="['$DATA_DIR/test_aime.parquet','$DATA_DIR/test_math500.parquet']"
+val_files="['$DATA_DIR/test_aime.parquet','$DATA_DIR/test_aime25.parquet','$DATA_DIR/test_math500.parquet','$DATA_DIR/test_gpqa_diamond.parquet','$DATA_DIR/test_olympiadbench_math_en.parquet']"
 
 CKPT_DIR=/home/escanord/duy/checkpoints/verl/pivot-v22b/qwen3_1p7b_base
 

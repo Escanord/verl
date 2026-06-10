@@ -7,7 +7,7 @@ MODEL="${MODEL:-Qwen/Qwen3-4B-Base}"
 REWARD_FN="$(dirname "$0")/guru_rl_reward.py"
 
 train_files="$DATA_DIR/train.parquet"
-val_files="['$DATA_DIR/test_aime.parquet','$DATA_DIR/test_math500.parquet']"
+val_files="['$DATA_DIR/test_aime.parquet','$DATA_DIR/test_aime25.parquet','$DATA_DIR/test_math500.parquet','$DATA_DIR/test_gpqa_diamond.parquet','$DATA_DIR/test_olympiadbench_math_en.parquet']"
 
 CKPT_DIR=/storage/workspace/server-1/duy/checkpoints/verl/grpo/qwen3_4b_base
 

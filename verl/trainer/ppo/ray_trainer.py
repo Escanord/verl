@@ -1009,12 +1009,14 @@ class RayPPOTrainer:
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
 
-    def _save_checkpoint(self):
+    def _save_checkpoint(self, folder_name=None, write_latest_iter=True, save_dataloader=True):
         from verl.utils.fs import local_mkdir_safe
 
-        # path: given_path + `/global_step_{global_steps}` + `/actor`
+        # path: given_path + `/{folder_name}` + `/actor`
+        if folder_name is None:
+            folder_name = f"global_step_{self.global_steps}"
         local_global_step_folder = os.path.join(
-            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
+            self.config.trainer.default_local_dir, folder_name
         )
 
         print(f"local_global_step_folder: {local_global_step_folder}")
@@ -1023,7 +1025,7 @@ class RayPPOTrainer:
         actor_remote_path = (
             None
             if self.config.trainer.default_hdfs_dir is None
-            else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
+            else os.path.join(self.config.trainer.default_hdfs_dir, folder_name, "actor")
         )
 
         remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
@@ -1049,20 +1051,23 @@ class RayPPOTrainer:
                 None
                 if self.config.trainer.default_hdfs_dir is None
                 else os.path.join(
-                    self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", str(Role.Critic)
+                    self.config.trainer.default_hdfs_dir, folder_name, str(Role.Critic)
                 )
             )
             self.critic_wg.save_checkpoint(
                 critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
             )
 
-        # save dataloader
-        local_mkdir_safe(local_global_step_folder)
-        dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
-        dataloader_state_dict = self.train_dataloader.state_dict()
-        torch.save(dataloader_state_dict, dataloader_local_path)
+        # save dataloader (skip for best-ckpt overwrites — model weights suffice for eval)
+        if save_dataloader:
+            local_mkdir_safe(local_global_step_folder)
+            dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
+            dataloader_state_dict = self.train_dataloader.state_dict()
+            torch.save(dataloader_state_dict, dataloader_local_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
+        if not write_latest_iter:
+            return
         if (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
             and self.config.actor_rollout_ref.actor.checkpoint.async_save
@@ -1077,6 +1082,69 @@ class RayPPOTrainer:
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+
+    def _init_best_ckpt_tracker(self):
+        self.best_val_metric = -float("inf")
+        self.best_val_step = -1
+        tracker_path = os.path.join(
+            self.config.trainer.default_local_dir, "best", "metric.json"
+        )
+        if not os.path.exists(tracker_path):
+            return
+        try:
+            with open(tracker_path) as f:
+                d = json.load(f)
+            self.best_val_metric = float(d.get("metric_value", -float("inf")))
+            self.best_val_step = int(d.get("step", -1))
+            print(
+                f"[best-ckpt] resumed tracker: best={self.best_val_metric:.4f} "
+                f"@ step {self.best_val_step}"
+            )
+        except Exception as e:
+            print(f"[best-ckpt] failed to load tracker ({tracker_path}): {e}")
+
+    def _maybe_save_best_ckpt(self, val_metrics):
+        if not val_metrics:
+            return
+        best_metric_key = self.config.trainer.get(
+            "best_metric_key", "val-core/math__aime_repeated_8x/acc/mean@16"
+        )
+        current = val_metrics.get(best_metric_key)
+        if current is None:
+            return
+        if not hasattr(self, "best_val_metric"):
+            self._init_best_ckpt_tracker()
+        if current <= self.best_val_metric:
+            return
+        import shutil
+
+        prev_val, prev_step = self.best_val_metric, self.best_val_step
+        self.best_val_metric = float(current)
+        self.best_val_step = int(self.global_steps)
+        print(
+            f"[best-ckpt] step={self.global_steps} {best_metric_key}={current:.4f} "
+            f"(prev best={prev_val:.4f} @ step {prev_step}) — saving"
+        )
+        best_folder = os.path.join(self.config.trainer.default_local_dir, "best")
+        if os.path.isdir(best_folder):
+            shutil.rmtree(best_folder, ignore_errors=True)
+        self._save_checkpoint(
+            folder_name="best", write_latest_iter=False, save_dataloader=False
+        )
+        tracker_path = os.path.join(best_folder, "metric.json")
+        try:
+            with open(tracker_path, "w") as f:
+                json.dump(
+                    {
+                        "step": self.best_val_step,
+                        "metric_key": best_metric_key,
+                        "metric_value": self.best_val_metric,
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception as e:
+            print(f"[best-ckpt] failed to write tracker ({tracker_path}): {e}")
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -1533,6 +1601,7 @@ class RayPPOTrainer:
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
+        self._init_best_ckpt_tracker()
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -1543,6 +1612,7 @@ class RayPPOTrainer:
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
+            self._maybe_save_best_ckpt(val_metrics)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -1610,7 +1680,13 @@ class RayPPOTrainer:
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                        self.checkpoint_manager.sleep_replicas()
+                        # NOTE: sleep_replicas() frees vLLM KV cache; next generate
+                        # has to wake and re-allocate, invalidating captured cudagraphs.
+                        # When filter_groups is enabled with retries, this kills the
+                        # second generate. Skip sleep here for filter_groups path;
+                        # sleep only after filter_groups is satisfied (below, line ~1820).
+                        if _filter_groups_cfg is None or not _filter_groups_cfg.enable:
+                            self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
 
@@ -1735,7 +1811,12 @@ class RayPPOTrainer:
                                 # trigger a CUDA error in flash_attn's builder.build().
                                 # Clearing here costs one cache warm-up on re-runs
                                 # (rare) while keeping prefix caching for all normal steps.
-                                self.async_rollout_manager.clear_kv_cache()
+                                # NOTE: with prefix_caching=False (DAPO on vLLM 0.11),
+                                # reset_prefix_cache() touches internal state in a way
+                                # that breaks the next forward pass (cuda_piecewise_backend
+                                # general_shape fallback CUDA driver error). Skip it.
+                                if self.config.actor_rollout_ref.rollout.get("enable_prefix_caching", True):
+                                    self.async_rollout_manager.clear_kv_cache()
                                 continue
                             else:
                                 raise ValueError(
@@ -1744,7 +1825,11 @@ class RayPPOTrainer:
                                     f"Increase max_num_gen_batches or check your reward function."
                                 )
 
-                        # Enough prompts: truncate to target trajectory count and proceed
+                        # Enough prompts: truncate to target trajectory count and proceed.
+                        # Sleep vLLM now to free KV memory for the upcoming actor training.
+                        # (Sleep was deferred from the per-generate location above to avoid
+                        # invalidating captured cudagraphs across filter_groups retries.)
+                        self.checkpoint_manager.sleep_replicas()
                         _traj_bsz = _prompt_bsz * self.config.actor_rollout_ref.rollout.n
                         batch = _fg_accum_batch[:_traj_bsz]
                         batch.meta_info["global_token_num"] = torch.sum(
@@ -2190,6 +2275,7 @@ class RayPPOTrainer:
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+                    self._maybe_save_best_ckpt(val_metrics)
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (

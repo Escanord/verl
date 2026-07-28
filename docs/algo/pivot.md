@@ -1687,3 +1687,148 @@ Key hyperparameters: `pivot_version=2`, `langevin_rollout=True`, `entropy_trigge
 **Conclusion**: v17b confirms the PIVOT response-length ceiling (~1000 tokens) as the binding constraint. Both HEG and PIVOT variants cap at ~1000 tokens while GRPO grows to 2000+; this is the mechanism by which GRPO overtakes. Stopped at step 137.
 
 **Summary**: GRPO on Qwen3-4B-Base from scratch achieves MATH mean@16=78.8% and AIME mean@16=11.2% at step 220 — substantially better than the 3B instruct GRPO baseline (61.5% / 1.8%). AIME best@16=23.8% is the all-time high across all runs. The larger batch size (1024) was critical: at batch=512 (steps 1–20) the gradient signal was too sparse; the switch to 1024 at step 20 drove rapid learning.
+
+---
+
+### PIVOT-v18 on Qwen3-4B-Base (asymmetric IS + target-band G)
+
+**Config**: Two fixes over v17c targeting the collapse pathology. Script: `run_qwen3_4b_base_pivot_v18.sh`.
+
+1. **Asymmetric IS correction (loss side).** Negative-advantage trigger positions use `min(log_p_lan, log_π_old)` as the denominator, so the effective ratio recovers to standard GRPO strength for wrong committed paths. Positive-advantage positions keep the v17c geometric-mean blend unchanged. Enabled via `lan_grpo_asym_is=True`.
+2. **Target-band G signal (rollout side).** Replaces the v17c `median(H_past) − H_current` feedback with `H_current − α · H_first`, where `H_first` is the entropy at the trajectory's first trigger. G commits when H > α·H_first, stops near the target, reverses if overshot. Enabled via `langevin_alpha_target=0.7` (allowing 30% entropy decay from trajectory start before reversing).
+
+Key hyperparameters (new/changed vs v17b): `lan_grpo_asym_is=True`, `langevin_feedback=True`, `langevin_alpha_target=0.7`, `langevin_exploit_ratio=0.6`, `langevin_momentum=0.7`. Everything else inherited from v17c: `pivot_version=2`, `entropy_trigger_only=True`, `trig_percentile=85`, `entropy_threshold=0.4`, `langevin_K=1`, `langevin_top_k=20`, `langevin_eta=0.1`, `langevin_sigma=0.01`, `langevin_min_trigger_position=200`, `lan_grpo_coeff=1.0`, `entropy_cap=0.8`.
+
+**Behavior**: Fixed the wrong-path IS-gating pathology of v17c but did not on its own suppress length collapse — the Langevin shortcut mechanism still fires because `min_trigger_position=200` is well within the collapsed-length regime. Established the "target-band G" formulation used by all subsequent versions.
+
+---
+
+### PIVOT-v18b on Qwen3-4B-Base (CUDA-graph capture, algo-equivalent to v18)
+
+**Config**: Same algorithm as v18 with `lan_use_cuda_graph=True` routing rollouts through `PIVOTv18bLangevinAdapter`. Script: `run_qwen3_4b_base_pivot_v18b.sh`.
+
+Changes are purely implementation-level:
+- G state lives fully on GPU (no per-proc G tensors).
+- Langevin perturbation kernel is CUDA-graph-captured for reduced CPU overhead.
+- G is updated **before** graph replay so Langevin uses the freshest momentum.
+- `entropy_threshold` is fixed from config (the adaptive `trig_percentile` path is not wired into the graph; each proc still uses its own `proc.entropy_threshold` for the trigger decision, but the graph itself uses the config-fixed threshold).
+
+**Behavior**: Bit-for-bit reproduces v18's training trajectory with ~2× lower Langevin wall-clock overhead. No algorithmic difference expected; used as the throughput baseline for v18-family variants.
+
+---
+
+### PIVOT-v18c on Qwen3-4B-Base (v18 + length penalty)
+
+**Config**: v18 with an additional length penalty on rollout scores. Script: `run_qwen3_4b_base_pivot_v18c.sh`.
+
+    penalty = lp_coef · (min(resp_len / lp_min_len, 1.0) − 1.0)
+
+Added to group scores **before** GRPO normalization so short responses score worse than long ones within the same prompt group. Initial config: `length_penalty_coef=2.0`, `length_penalty_min_len=1000`; the coefficient was later swept to 0.5. Additionally reverts `langevin_min_trigger_position` back to 200 (pumping it to 800/1000 in earlier explorations had zero effect on the timing of collapse — always step 29–31).
+
+Key hyperparameters (new/changed vs v18): `+algorithm.length_penalty_coef=2.0`, `+algorithm.length_penalty_min_len=1000`, `langevin_min_trigger_position=200`.
+
+**Behavior**: On 4B, the length penalty prevents the sharp step-29 collapse but a slower drift toward short outputs still emerges by step 60–80. On 1.7B, the length penalty is more effective and the run reaches useful MATH accuracy. Established the length-penalty formulation later carried over to `drift_method.md §3.4` (subsequently superseded by KL-in-reward in v22).
+
+---
+
+### PIVOT-v18d on Qwen3-4B-Base (v18c ablation: top-K = 150)
+
+**Config**: v18c with `langevin_top_k=150` (vs v18c's 20). All other hyperparameters identical. Script: `run_qwen3_4b_base_pivot_v18d.sh`.
+
+**Purpose**: Test whether allowing Langevin to reach lower-probability "reasoning pivot" tokens ("revisit", "wait", "actually") — outside the top-20 but within the plausible vocabulary at trigger positions — improves outcome.
+
+**Behavior**: Widening the top-K subspace increased perturbation into off-manifold tokens and worsened length collapse. Confirmed the "head, not tail" §3.2 story from `drift_method.md`: perturbation should be restricted to a small top-K subspace to remain on the coherent-continuation manifold.
+
+---
+
+### PIVOT-v19 (DRIFT-v19) on Qwen3-4B-Base (EOS mask + window-based adaptive t_min, length penalty removed)
+
+**Config**: v18c structure with two surgical changes targeting length collapse. Script: `run_qwen3_4b_base_pivot_v19.sh`.
+
+1. **EOS-class token mask on the Langevin top-K subspace.** Langevin can no longer push probability toward `</answer>`, `<|im_end|>`, EOS — closing the shortcut-to-termination pathway at the perturbation level.
+2. **Adaptive `t_min = clamp(median(recent_lengths) − W_min, floor, cap)`** with `W_min=400, floor=400, cap=2500`. Anchors on a guaranteed Langevin firing window `W_min` on a median-length rollout; at the current Qwen3 length regime (median ~1000–1500) this places `t_min` in [600, 1100], replicating the empirical 1.7B fix where pumping `t_min ~ 800` stopped collapse.
+
+The v18c length penalty is **removed** — the goal is to verify that (1) + (2) prevent collapse on their own.
+
+**Behavior on 4B**: Catastrophic collapse at step 35–50 (length 1478 → 151), plateau at length 30–100 with MATH ~30% AIME ~0% for ~200 steps, then spontaneous recovery (length back to 465 by step 315, MATH 62%). Diagnostic: the window-based `t_min` **drops with length**, so Langevin keeps firing in the collapsed regime and reinforces the short-answer mode. This mismatch motivated v20's monotonic-peak formulation.
+
+**Behavior on 1.7B**: v19 works well — no collapse, comparable or better ceiling than v18c.
+
+---
+
+### PIVOT-v20 (DRIFT-v20) on Qwen3-4B-Base (monotonic-peak t_min ratchet)
+
+**Config**: v19's EOS mask + a **monotonic-peak** t_min replacing v19's window-based adaptive rule. Script: `run_qwen3_4b_base_pivot_v20.sh`.
+
+    t_min(step) = clamp(α · peak_length, floor, cap)
+    peak_length = max(peak_length, current_median_length)     # monotonic, never decreases
+
+With `α=0.6`, `floor=200`, `cap=3200`. Key insight: v19's window-based `t_min` drops with length and lets Langevin keep firing in the collapsed regime; v20's monotonic-peak `t_min` **ratchets up** with length, so if the median length dips below `α · peak`, Langevin auto-disables — the policy can then recover via plain GRPO without further Langevin-driven exploration of the shortcut.
+
+Key hyperparameters (new vs v19): `langevin_min_trigger_position_mode=peak`, `langevin_peak_alpha=0.6`, `langevin_t_min_floor=200`, `langevin_t_min_cap=3200`. Inherits v19's `langevin_mask_eos=True`.
+
+**Behavior**: Solved v19's 4B catastrophic collapse. The peak-ratchet t_min is now inherited by all subsequent versions and is the mechanism referenced in `drift_method.md §3.1`.
+
+---
+
+### PIVOT-v21 (DRIFT-v21) on Qwen3-4B-Base (soft-IS multiplier — clean per-token weight)
+
+**Config**: v20 with a **soft-IS multiplier** replacing the v18-family blended-denominator IS correction. Script: `run_qwen3_4b_base_pivot_v21.sh`.
+
+Derived directly from the unbiased policy gradient `∇J = E_{a∼q}[ (π_θ/q) · A · ∇log π_θ(a) ]` with `q = π_lan_old` at triggers. Factoring `(π_θ/q) = (π_θ/π_old) · (π_old/q)` lets PPO's ratio stay at `r = π_θ/π_old` (trust region intact) and pushes the off-policy correction `(π_old/q)` onto the advantage as a per-token weight:
+
+    w_t = min(1, π_old(a_t) / π_lan_old(a_t))    at trigger positions
+        = 1                                        elsewhere
+    A'_t = A_t · w_t
+
+Equivalent to multiplying the per-token PG loss by `w_t`. The cap at 1 keeps the estimator variance-bounded and unbiased in the rate-inflation regime (where Langevin raises the committed token's probability) — precisely the regime that drives length collapse. See `drift_method.md §3.5` for the derivation.
+
+Key hyperparameters (new/changed vs v20): `lan_grpo_soft_is=True`, `lan_grpo_correct_is=False` (old denominator patch off), `lan_grpo_denom_blend` dropped, `lan_grpo_asym_is` dropped, `lan_grpo_correct_mu` dropped.
+
+**Behavior**: v21 **collapsed harder than v18+** on 4B. Diagnostic: v20's peak-ratchet t_min disables Langevin post-collapse (correct behavior), but that means v21's IS correction only acts at trigger positions and becomes a no-op once the policy has already found the short-answer shortcut. Plain GRPO with a length-independent ±1 reward then has a degenerate local optimum at "guess the answer template directly" whenever the model's reasoning ability is below its short-guess success rate. This failure mode motivated v22's reward-level shaping.
+
+---
+
+### PIVOT-v22 (DRIFT-v22) on Qwen3-4B-Base and Qwen3-8B-Base (KL-in-reward mean-KL shaping — current design)
+
+**Config**: v21 + **InstructGPT-style per-rollout KL-in-reward shaping** on top of the v21 soft-IS multiplier. Scripts: `run_qwen3_4b_base_pivot_v22.sh`, `run_qwen3_8b_base_pivot_v22.sh`, `run_qwen3_1p7b_base_pivot_v22.sh`.
+
+Reward shaping applied per rollout **before** advantage normalization:
+
+    r'^{i,j}  =  r^{i,j}  −  β_KL · (1 / L^{i,j}) · Σ_t KL̂( π_θ(· | s_t) ‖ π_ref(· | s_t) )
+
+- **Mean-KL, not sum-KL.** Long natural rollouts have low per-token KL from base and receive negligible penalty; short shortcut rollouts have high per-token KL (the collapsed policy is OOD relative to the natural reasoning manifold) and receive heavy penalty. Sum-of-KL (verl's default) would bias the wrong direction because it grows linearly with length.
+- **Applied at reward level, not loss level.** Because within-group mean-subtraction removes any additive shift common to a group, an in-loss KL only anchors global drift and cannot reshape within-group ranking. The in-reward form pushes short-collapsed correct rollouts below long-correct ones in advantage rank — a within-group signal the policy gradient uses to prefer full reasoning.
+
+The v21 soft-IS multiplier stays on. The mechanisms compose: the soft-IS handles off-policy gradient at Langevin-firing positions; the KL-shaped reward handles the global GRPO objective. Diagnostic per-length-stratum reward logging (`diag/short_lt200_*`, `diag/mid_200_800_*`, `diag/long_ge800_*`) is added at every train step to verify the collapse mechanism.
+
+Key hyperparameters (new/changed vs v21): `algorithm.use_kl_in_reward=True`, `+algorithm.kl_in_reward_mode=rollout_mean`, `algorithm.kl_penalty=low_var_kl`, `algorithm.kl_ctrl.kl_coef=0.2` (4B) / `2.0` (8B) / `0.2` (1.7B). All v20/v21 mechanisms retained: peak-ratchet t_min, EOS mask, soft-IS multiplier, target-band G with `α_target=0.7`, `entropy_cap=0.8`, top-K=20, clip-higher (0.2, 0.28), in-loss `kl_loss_coef=0.001`.
+
+**Behavior on Qwen3-4B-Base (guru_rl, ran to step 229)**:
+
+| Metric | Peak | Step |
+|---|---|---|
+| MATH mean@16 | **79.42%** | 195 |
+| MATH best@16 | **90.08%** | 80 |
+| AIME24 mean@16 | **12.81%** | 190 |
+| AIME24 best@16 | **24.40%** | 205 |
+
+Length collapse fully suppressed; response length remains in the natural regime (~1000+ tokens) throughout training. Entropy trajectory is a controlled explosion-then-plateau pattern (peak ~4.7 near step 109, settles into a healthy plateau ~2.0–2.5) rather than the collapse-to-zero pattern of v17b/v21.
+
+**Behavior on Qwen3-1.7B-Base (73 steps logged)**: MATH mean@16 = 16.12% (step 65), AIME24 mean@16 = 0.44% (step 50). Same non-collapse trajectory as 4B, on a smaller-model scale.
+
+**Behavior on Qwen3-8B-Base**: `kl_coef=2.0` is the tuned coefficient (0.2 was insufficient to prevent length collapse on 8B given the base model's stronger prior). Confirms KL-in-reward is a scale-general defense: the coefficient scales with the base policy's confidence, but the mechanism itself does not require length-target retuning.
+
+**Conclusion**: v22 is the current DRIFT design. The switch from v18c's length-target penalty (`λ, L_target`) to per-rollout mean-KL removes both hyperparameters and gives a scale-free length-collapse defense whose "target" is implicitly the base policy's own length distribution. See `drift_method.md §3.4` for the paper-prose treatment.
+
+---
+
+### PIVOT-v22b on Qwen3-4B-Base (ablation: v22 without positional guard)
+
+**Config**: v22 with the positional guard **removed** — `langevin_min_trigger_position=0` (mode=static). All other hyperparameters identical to v22 (KL-in-reward + v21 soft-IS + everything else). Script: `run_qwen3_4b_base_pivot_v22b.sh`.
+
+**Purpose**: Test whether the v20 peak-ratchet `t_min` positional guard is load-bearing for collapse prevention in v22, or whether v22's KL-in-reward reward shaping alone is sufficient.
+
+**Hypothesis**: If KL-in-reward is the dominant defense, v22b should still avoid collapse. If v22b collapses but v22 does not, `t_min` is doing meaningful work even with KL shaping in place.
+
+**Behavior**: [pending analysis — trained but not yet fully written up]. Documented here as the ablation companion to v22 for the paper's §6.4 ablation section.

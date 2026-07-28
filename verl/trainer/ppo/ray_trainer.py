@@ -516,7 +516,11 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            # default=str coerces non-JSON-serializable values (numpy scalars,
+            # code ground-truth test-spec objects, etc.) to their string form
+            # instead of raising TypeError and killing the whole run.  The dump
+            # is a diagnostic artifact, so lossy string coercion is acceptable.
+            lines.append(json.dumps(entry, ensure_ascii=False, default=str))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")

@@ -872,7 +872,6 @@ class PIVOTv2RolloutProcessor:
         langevin_eta: float = 0.1,
         langevin_sigma: float = 0.01,
         langevin_top_k: int = 0,
-        pivot_version: int = 2,
         entropy_trigger_only: bool = False,
         langevin_momentum: float = 0.0,
         effective_tmin: int = 0,
@@ -887,7 +886,6 @@ class PIVOTv2RolloutProcessor:
         self.eta = langevin_eta
         self.sigma = langevin_sigma
         self.top_k = langevin_top_k
-        self.pivot_version = pivot_version
         self.entropy_trigger_only = entropy_trigger_only
         self.langevin_momentum = langevin_momentum
         self.effective_tmin = effective_tmin
@@ -919,9 +917,6 @@ class PIVOTv2RolloutProcessor:
         # update_state so dp_actor.py can skip the (n, n_trig, vocab) logit tensor.
         self._trigger_topk_logp: list = []  # list of (list[int], list[float]) — CPU
         self._lan_log_p_accum: list = []    # per-step log_p_lan cache (0.0 unresolved)
-        # MALA accept/reject counters (legacy; always 0 now, still summed by adapter).
-        self._mala_accepted: int = 0
-        self._mala_total: int = 0
         # Feedback-guided Langevin state (langevin_feedback=True only).
         # G: accumulated gradient estimate direction (full-vocab, cpu).
         # _prev_eps: noise vector applied at last triggered position (for G update).
@@ -1180,8 +1175,6 @@ try:
             self._agg_n_completed: int = 0
             self._agg_entropy_all: list = []
             self._agg_delta_vars: list = []
-            self._agg_mala_accepted: int = 0
-            self._agg_mala_total: int = 0
             self._agg_fb_signals: list = []  # feedback signal values across all requests
             # v19: rolling response-length buffer for adaptive t_min.
             # Appended in update_state() when each request completes; consumed in
@@ -1368,7 +1361,6 @@ try:
                 langevin_eta=self._pivot_cfg.get("langevin_eta", 0.1),
                 langevin_sigma=self._pivot_cfg.get("langevin_sigma", 0.01),
                 langevin_top_k=self._pivot_cfg.get("langevin_top_k", 0),
-                pivot_version=self._pivot_cfg.get("pivot_version", 2),
                 entropy_trigger_only=self._pivot_cfg.get("entropy_trigger_only", False),
                 langevin_momentum=float(self._pivot_cfg.get("langevin_momentum", 0.0)),
                 effective_tmin=_t_min_effective,
@@ -1610,8 +1602,6 @@ try:
                         self._agg_entropy_all.extend(proc._entropy_all)
                     if proc._delta_vars_seen:
                         self._agg_delta_vars.extend(proc._delta_vars_seen)
-                    self._agg_mala_accepted += proc._mala_accepted
-                    self._agg_mala_total += proc._mala_total
                     if proc._fb_signals:
                         self._agg_fb_signals.extend(proc._fb_signals)
 
@@ -1674,14 +1664,6 @@ try:
                             f"(+signal=entropy fell=constructive, -signal=entropy rose=disruptive)",
                             flush=True,
                         )
-                    if self._agg_mala_total > 0:
-                        accept_rate = self._agg_mala_accepted / self._agg_mala_total
-                        print(
-                            f"PIVOT-v2 [mala] proposals={self._agg_mala_total} "
-                            f"accepted={self._agg_mala_accepted} "
-                            f"accept_rate={accept_rate:.3f}",
-                            flush=True,
-                        )
                     # ΔVar distribution — calibration for delta_var_threshold
                     if self._agg_delta_vars:
                         dv_s = sorted(self._agg_delta_vars[-2000:])
@@ -1740,8 +1722,6 @@ try:
                             self._warmup_ent_threshold = _buf[_idx]
                         self._agg_entropy_all = []
                         self._agg_delta_vars = []
-                        self._agg_mala_accepted = 0
-                        self._agg_mala_total = 0
                         self._agg_fb_signals = []
                         self._adaptive_ent_logged = False
                 except Exception:

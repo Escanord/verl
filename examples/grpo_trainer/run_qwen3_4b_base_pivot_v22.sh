@@ -5,7 +5,8 @@
 # clip 0.2/0.2, use_kl_in_reward=False.
 #   - soft-IS off-policy correction (lan_grpo_soft_is=True): PPO ratio stays
 #     π_θ/π_old, correction via advantage reweight w=min(1,π_old/π_lan_old).
-#   - peak-mode trigger gate: langevin_tmin (floor) / _cap / _peak_alpha / _mode
+#   - static trigger gate: langevin_tmin=400 (fires past position 400; peak mode
+#     latched to the cap at 16k response length so it never fired)
 #   - langevin_top_k=128, langevin_exploit_ratio=0.9
 set -x
 
@@ -68,10 +69,8 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.pivot.langevin_top_k=128 \
     +actor_rollout_ref.rollout.pivot.langevin_eta=0.1 \
     +actor_rollout_ref.rollout.pivot.langevin_sigma=0.01 \
-    +actor_rollout_ref.rollout.pivot.langevin_tmin=500 \
-    +actor_rollout_ref.rollout.pivot.langevin_tmin_mode=peak \
-    +actor_rollout_ref.rollout.pivot.langevin_tmin_peak_alpha=0.6 \
-    +actor_rollout_ref.rollout.pivot.langevin_tmin_cap=3200 \
+    +actor_rollout_ref.rollout.pivot.langevin_tmin=400 \
+    +actor_rollout_ref.rollout.pivot.langevin_tmin_mode=static \
     +actor_rollout_ref.rollout.pivot.langevin_mask_eos=True \
     +actor_rollout_ref.rollout.pivot.langevin_momentum=0.7 \
     +actor_rollout_ref.rollout.pivot.langevin_feedback=True \

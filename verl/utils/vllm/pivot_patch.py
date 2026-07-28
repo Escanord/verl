@@ -961,24 +961,11 @@ class PIVOTv2RolloutProcessor:
         """
         if self.langevin_feedback and self._fb_triggered and self._prev_eps is not None:
             if self._entropy_before:
-                if self.langevin_alpha_target > 0.0:
-                    H_first = self._entropy_before[0]
-                    H_target = H_first * self.langevin_alpha_target
-                    signal = H_before - H_target
-                else:
-                    _buf = self._entropy_before[-50:]
-                    _ref = sorted(_buf)[len(_buf) // 2]
-                    signal = _ref - H_before
+                H_first = self._entropy_before[0]
+                H_target = H_first * self.langevin_alpha_target
+                signal = H_before - H_target
                 self._fb_signals.append(signal)
                 feedback = signal * self._prev_eps
-                if self.langevin_momentum_beta2 > 0.0:
-                    if self._sq_G is None:
-                        self._sq_G = torch.zeros_like(feedback)
-                    self._sq_G = (
-                        self.langevin_momentum_beta2 * self._sq_G
-                        + (1.0 - self.langevin_momentum_beta2) * feedback ** 2
-                    )
-                    feedback = feedback / (self._sq_G.sqrt() + 1e-8)
                 gamma = self.langevin_momentum if self.langevin_momentum > 0.0 else 0.7
                 if self._G is None:
                     self._G = (1.0 - gamma) * feedback
@@ -1084,14 +1071,6 @@ class PIVOTv2RolloutProcessor:
                 signal = H_before - H_target
                 self._fb_signals.append(signal)
                 feedback = signal * self._prev_eps  # _prev_eps stays on GPU
-                if self.langevin_momentum_beta2 > 0.0:
-                    if self._sq_G is None:
-                        self._sq_G = torch.zeros_like(feedback)
-                    self._sq_G = (
-                        self.langevin_momentum_beta2 * self._sq_G
-                        + (1.0 - self.langevin_momentum_beta2) * feedback ** 2
-                    )
-                    feedback = feedback / (self._sq_G.sqrt() + 1e-8)
                 gamma = self.langevin_momentum if self.langevin_momentum > 0.0 else 0.7
                 if self._G is None:
                     self._G = (1.0 - gamma) * feedback

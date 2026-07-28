@@ -3,23 +3,35 @@
 #
 # Reference: "Beyond the 80/20 Rule: High-Entropy Minority Tokens Drive Effective
 # Reinforcement Learning for LLM Reasoning", Wang et al., NeurIPS 2025.
+#
+# Matches the GRPO 8B baseline scale (train_bsz=1024, n=8, light KL=0.001,
+# max_response=4096), with the single algorithmic change of restricting
+# policy-gradient updates to the top-20% highest-entropy tokens via
+# +actor.entropy_top_ratio=0.2.
 set -x
 
-DATA_DIR="${DATA_DIR:-/storage/workspace/server-1/duy/data/guru_rl}"
-MODEL="${MODEL:-/storage/workspace/server-1/duy/checkpoints/models/Qwen3-8B-Base}"
+DATA_DIR="${DATA_DIR:-/home/escanord/duy/data/guru_rl}"
+MODEL="${MODEL:-/home/escanord/duy/checkpoints/models/Qwen3-8B-Base}"
 REWARD_FN="$(dirname "$0")/guru_rl_reward.py"
 
 train_files="$DATA_DIR/train.parquet"
-val_files="['$DATA_DIR/test_aime.parquet','$DATA_DIR/test_math500.parquet']"
+val_files="['$DATA_DIR/test_aime.parquet','$DATA_DIR/test_aime25.parquet','$DATA_DIR/test_math500.parquet','$DATA_DIR/test_gpqa_diamond.parquet','$DATA_DIR/test_olympiadbench_math_en.parquet']"
 
-CKPT_DIR=/storage/workspace/server-1/duy/checkpoints/verl/high-ent-grpo/qwen3_8b_base
+CKPT_DIR=/home/escanord/duy/checkpoints/verl/high-ent-grpo/qwen3_8b_base
 
-source /storage/workspace/server-1/duy/venv-vault/miniconda3/etc/profile.d/conda.sh
+source /home/escanord/duy/venv-vault/miniconda3/etc/profile.d/conda.sh
 conda activate verl
 
-export VERL_FILE_LOGGER_ROOT=/storage/workspace/server-1/duy/checkpoints/verl/high-ent-grpo
+export VERL_FILE_LOGGER_ROOT=/home/escanord/duy/checkpoints/verl/high-ent-grpo
+export VERL_VLLM_DISABLE_CASCADE_ATTN=1
+export VERL_VLLM_CUDAGRAPH_MODE=PIECEWISE
 export VLLM_FLASH_ATTN_VERSION=2
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+export HF_HOME=$HOME/duy/.cache/huggingface
+export HF_DATASETS_CACHE=$HOME/duy/.cache/huggingface/datasets
+export TRANSFORMERS_CACHE=$HOME/duy/.cache/huggingface/hub
+mkdir -p "$HF_DATASETS_CACHE" "$TRANSFORMERS_CACHE"
+
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
@@ -39,7 +51,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
     +actor_rollout_ref.actor.entropy_top_ratio=0.2 \
@@ -49,10 +61,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
-    +actor_rollout_ref.rollout.enable_sleep_mode=False \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
-    actor_rollout_ref.rollout.max_num_seqs=512 \
+    actor_rollout_ref.rollout.max_num_seqs=256 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.n=16 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
@@ -73,4 +84,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.total_epochs=15 \
     trainer.default_local_dir="$CKPT_DIR" \
+    ray_kwargs.ray_init.num_cpus=32 \
     "$@"

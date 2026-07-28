@@ -198,49 +198,6 @@ def _langevin_sample(
     return logits
 
 
-def _mala_step(logits: torch.Tensor, eta: float, sigma: float) -> torch.Tensor:
-    """One MALA step: Langevin proposal + entropy-MH accept/reject.
-
-    Operates only on finite (non -inf) logit dimensions so top-k masks are
-    respected.  Uses a pure entropy Metropolis criterion (log α = H_prop - H_cur)
-    rather than the full MALA q-ratio correction.  The q-ratio correction requires
-    σ ~ η to be numerically well-conditioned; when σ << η (e.g. σ=0.01, η=0.3)
-    the 1/(2σ²) amplifier makes it blow up to ~O(100), rendering the criterion
-    vacuous (acceptance rate ≈ 100%).  The entropy-MH rule gives meaningful
-    rejection of entropy-decreasing proposals without touching σ or η.
-    """
-    inf_mask = ~torch.isfinite(logits.float())
-    logits_f = logits.float()
-
-    # Current state
-    p = torch.softmax(logits_f, dim=-1)
-    log_p = torch.log(p.clamp(min=1e-12))
-    H_cur = -(p * log_p).sum()
-    grad_H = -p * (log_p + H_cur)
-
-    # Proposal: only add noise/gradient on active (non -inf) dimensions
-    noise = torch.zeros_like(logits_f)
-    active = ~inf_mask
-    n_active = int(active.sum().item())
-    if n_active > 0:
-        noise[active] = sigma * torch.randn(n_active, device=logits.device, dtype=logits_f.dtype)
-    logits_prop = (logits_f + eta * grad_H + noise).masked_fill(inf_mask, float('-inf'))
-
-    # Proposed entropy
-    p_prop = torch.softmax(logits_prop, dim=-1)
-    log_p_prop = torch.log(p_prop.clamp(min=1e-12))
-    H_prop = -(p_prop * log_p_prop).sum()
-
-    # Entropy-MH acceptance: always accept entropy-increasing moves; reject
-    # entropy-decreasing moves with probability 1 - exp(H_prop - H_cur).
-    log_alpha = float(H_prop - H_cur)
-    accepted = torch.log(torch.rand(1, device=logits.device)).item() < log_alpha
-
-    if accepted:
-        return logits_prop.to(logits.dtype), True
-    return logits, False
-
-
 def _langevin_step_feedback(
     logits: torch.Tensor,
     sigma: float,
@@ -428,67 +385,6 @@ def _pivot_v18_update_G(
     feedback = signal.unsqueeze(-1) * prev_eps
     G_state.mul_(gamma).add_((1.0 - gamma) * feedback)
 
-
-def _langevin_step_momentum(
-    logits: torch.Tensor,
-    eta: float,
-    sigma: float,
-    gamma: float,
-    velocity: torch.Tensor,
-    sq_velocity: Optional[torch.Tensor] = None,
-    beta2: float = 0.999,
-    eps: float = 1e-8,
-    top_k: int = 0,
-) -> tuple:
-    """One Langevin step with momentum velocity that persists across triggers.
-
-    Returns (new_logits, new_velocity) or (new_logits, new_velocity, new_sq_velocity)
-    when sq_velocity is provided (Adam-style RMS normalization).
-
-    Momentum formulation:
-        step    = η·∇H + σ·noise
-        v_new   = γ·v_old + step
-        update  = v_new                          (no normalization)
-                = v_new / (√s_new + ε)           (with RMS normalization)
-        s_new   = β₂·s_old + (1-β₂)·step²       (second moment)
-    """
-    if top_k > 0:
-        safe_logits = logits.float().nan_to_num(nan=float('-inf'))
-        topk_vals, topk_idx = torch.topk(safe_logits, min(top_k, logits.size(-1)))
-        masked = torch.full_like(safe_logits, float('-inf'))
-        masked.scatter_(-1, topk_idx, topk_vals)
-        logits = masked.to(logits.dtype)
-
-    inf_mask = ~torch.isfinite(logits.float())
-    logits_f = logits.float()
-
-    p = torch.softmax(logits_f, dim=-1)
-    log_p = torch.log(p.clamp(min=1e-12))
-    H = -(p * log_p).sum()
-    grad_H = -p * (log_p + H)
-
-    noise = sigma * torch.randn_like(logits_f)
-    noise = noise.masked_fill(inf_mask, 0.0)
-
-    step = eta * grad_H + noise
-    new_velocity = gamma * velocity + step
-    new_velocity = new_velocity.masked_fill(inf_mask, 0.0)
-
-    if sq_velocity is not None:
-        new_sq_velocity = beta2 * sq_velocity + (1 - beta2) * step ** 2
-        new_sq_velocity = new_sq_velocity.masked_fill(inf_mask, 0.0)
-        update = new_velocity / (new_sq_velocity.sqrt() + eps)
-        update = update.masked_fill(inf_mask, 0.0)
-        new_logits = (logits_f + update).masked_fill(inf_mask, float('-inf')).to(logits.dtype)
-        return new_logits, new_velocity, new_sq_velocity
-
-    new_logits = (logits_f + new_velocity).masked_fill(inf_mask, float('-inf')).to(logits.dtype)
-    return new_logits, new_velocity
-
-
-# ---------------------------------------------------------------------------
-# PIVOTRolloutProcessor — one instance per vLLM generation request
-# ---------------------------------------------------------------------------
 
 class PIVOTRolloutProcessor:
     """
@@ -816,6 +712,20 @@ def set_langevin_cfg(cfg: dict) -> None:
     import json
     import os
     global _LANGEVIN_CFG
+    # Fail loud if a script still passes the OLD t_min key names — otherwise the
+    # renamed reader would silently fall back to a default (the exact silent-
+    # misconfig bug we are avoiding).
+    _OLD_TMIN_KEYS = {
+        "langevin_min_trigger_position", "langevin_min_trigger_position_mode",
+        "langevin_t_min_floor", "langevin_t_min_cap", "langevin_peak_alpha",
+    }
+    _present_old = _OLD_TMIN_KEYS & set(cfg.keys())
+    if _present_old:
+        raise ValueError(
+            f"Renamed pivot t_min config keys present: {sorted(_present_old)}. "
+            "Use: langevin_tmin (static value / peak+adaptive floor), "
+            "langevin_tmin_cap, langevin_tmin_peak_alpha, langevin_tmin_mode."
+        )
     serialisable = {k: v for k, v in cfg.items() if k != "tokenizer"}
     _LANGEVIN_CFG = dict(cfg)
     os.environ["_PIVOT_LANGEVIN_CFG"] = json.dumps(serialisable)
@@ -968,7 +878,7 @@ class PIVOTv2RolloutProcessor:
         langevin_momentum: float = 0.0,
         langevin_momentum_beta2: float = 0.0,
         langevin_mala: bool = False,
-        langevin_min_trigger_position: int = 0,
+        effective_tmin: int = 0,
         langevin_feedback: bool = False,
         langevin_exploit_ratio: float = 0.5,
         langevin_alpha_target: float = 0.0,
@@ -986,7 +896,7 @@ class PIVOTv2RolloutProcessor:
         self.langevin_momentum = langevin_momentum
         self.langevin_momentum_beta2 = langevin_momentum_beta2
         self.langevin_mala = langevin_mala
-        self.langevin_min_trigger_position = langevin_min_trigger_position
+        self.effective_tmin = effective_tmin
         self.langevin_feedback = langevin_feedback
         self.langevin_exploit_ratio = langevin_exploit_ratio  # α: G-direction fraction in ε
         self.langevin_alpha_target = langevin_alpha_target    # v18: 0 = off, >0 = H_first*alpha target
@@ -1109,39 +1019,17 @@ class PIVOTv2RolloutProcessor:
                 with torch.no_grad():
                     p = torch.softmax(logits.float(), dim=-1)
                     H = -(p * torch.log(p.clamp(min=1e-12))).sum().item()
-            if step % 4 == 0 and step >= self.langevin_min_trigger_position:
+            if step % 4 == 0 and step >= self.effective_tmin:
                 self._entropy_all.append(H)
             fire = H > self.entropy_threshold
             trigger_mode = "entropy"
             _step_trig_val = H  # tentative; zeroed below if position guard suppresses
-        else:
-            delta_var = self._delta_var_current
-            if delta_var > 0.0:
-                if step % 4 == 0 and step >= self.langevin_min_trigger_position:
-                    self._delta_vars_seen.append(delta_var)
-                fire = delta_var > self.delta_var_threshold
-                trigger_mode = "delta_var"
-            else:
-                if _precomputed_H is not None:
-                    H = _precomputed_H
-                else:
-                    with torch.no_grad():
-                        p = torch.softmax(logits.float(), dim=-1)
-                        H = -(p * torch.log(p.clamp(min=1e-12))).sum().item()
-                if step % 4 == 0 and step >= self.langevin_min_trigger_position:
-                    self._entropy_all.append(H)
-                fire = H > self.entropy_threshold
-                trigger_mode = "entropy"
-            # Only delta_var-mode triggers recorded; entropy fallback is not a
-            # group-level branch-point signal and should not gate the loss.
-            _step_trig_val = self._delta_var_current if (fire and trigger_mode == "delta_var") else 0.0
-
-        if fire and self.langevin_min_trigger_position > 0 and step < self.langevin_min_trigger_position:
+        if fire and self.effective_tmin > 0 and step < self.effective_tmin:
             fire = False
 
         # Append AFTER the position guard so the mask only reflects triggers that
         # actually fired (i.e. Langevin perturbation was applied). Recording pre-guard
-        # fire caused fake trigger entries when resp_len < langevin_min_trigger_position,
+        # fire caused fake trigger entries when resp_len < effective_tmin,
         # leading to spurious IS corrections in the actor with log_p_lan=0.
         self._step_delta_vars.append(_step_trig_val if fire else 0.0)
 
@@ -1189,17 +1077,11 @@ class PIVOTv2RolloutProcessor:
             self._G_updated = False
         elif self.langevin_feedback and self._fb_triggered and self._prev_eps is not None:
             if self._entropy_before:
-                if self.langevin_alpha_target > 0.0:
-                    # v18: target-band signal. H_first is the entropy at the first trigger
-                    # this trajectory — model-agnostic reference that adapts to policy state.
-                    H_first = self._entropy_before[0]
-                    H_target = H_first * self.langevin_alpha_target
-                    signal = H_before - H_target
-                else:
-                    # v17c: median-based signal
-                    _buf = self._entropy_before[-50:]
-                    _ref = sorted(_buf)[len(_buf) // 2]
-                    signal = _ref - H_before
+                # v18: target-band signal. H_first is the entropy at the first trigger
+                # this trajectory — model-agnostic reference that adapts to policy state.
+                H_first = self._entropy_before[0]
+                H_target = H_first * self.langevin_alpha_target
+                signal = H_before - H_target
                 self._fb_signals.append(signal)
                 feedback = signal * self._prev_eps  # _prev_eps stays on GPU
                 if self.langevin_momentum_beta2 > 0.0:
@@ -1244,75 +1126,6 @@ class PIVOTv2RolloutProcessor:
                     )
             self._prev_eps = _eps  # keep on GPU alongside _G
             self._fb_triggered = True
-        elif self.pivot_version == 4 and self._group_mean_logits is not None and not self.langevin_mala:
-            # v4: pull each rollout toward the group mean at this branch point.
-            # logits_new = (1 - eta) * logits + eta * group_mean + noise_scale * eps
-            # v4b (adaptive_noise): noise_scale = sigma * delta_var_norm, where
-            #   delta_var_norm = delta_var / mean(|group_mean|)
-            # This makes noise temperature proportional to inter-rollout divergence.
-            with torch.no_grad():
-                group_mean = self._group_mean_logits.to(logits.device, logits.dtype)
-                finite_mask = torch.isfinite(logits)
-                delta = self.eta * (group_mean - logits.float()).to(logits.dtype)
-                if self.sigma > 0:
-                    if self.adaptive_noise:
-                        mean_abs = group_mean.abs().mean().item()
-                        delta_var_norm = self._delta_var_current / (mean_abs + 1e-8)
-                        noise_scale = self.sigma * delta_var_norm
-                    else:
-                        noise_scale = self.sigma
-                    noise = (noise_scale * torch.randn_like(logits)).to(logits.dtype)
-                else:
-                    noise = torch.zeros_like(logits)
-                if self.langevin_momentum > 0.0:
-                    # Momentum: accumulate delta+noise into velocity across triggers.
-                    if self._velocity is None:
-                        self._velocity = torch.zeros_like(logits.float())
-                    step = (delta + noise).float()
-                    self._velocity = self.langevin_momentum * self._velocity + step
-                    self._velocity = torch.where(finite_mask, self._velocity, torch.zeros_like(self._velocity))
-                    logits = torch.where(finite_mask, logits + self._velocity.to(logits.dtype), logits)
-                else:
-                    logits = torch.where(finite_mask, logits + delta + noise, logits)
-        else:
-            if self.langevin_mala:
-                # MALA: apply top-k mask first (restricts to d=top_k space for
-                # good acceptance rate), then Metropolis-adjusted Langevin steps.
-                if self.top_k > 0:
-                    safe_logits = logits.float().nan_to_num(nan=float('-inf'))
-                    topk_vals, topk_idx = torch.topk(safe_logits, min(self.top_k, logits.size(-1)))
-                    masked = torch.full_like(safe_logits, float('-inf'))
-                    masked.scatter_(-1, topk_idx, topk_vals)
-                    logits = masked.to(logits.dtype)
-                with torch.no_grad():
-                    for _ in range(self.K):
-                        logits, _accepted = _mala_step(logits, self.eta, self.sigma)
-                        self._mala_total += 1
-                        if _accepted:
-                            self._mala_accepted += 1
-            elif self.langevin_momentum > 0.0:
-                # Momentum: velocity persists across trigger positions in this sequence.
-                if self._velocity is None:
-                    self._velocity = torch.zeros_like(logits.float())
-                if self.langevin_momentum_beta2 > 0.0 and self._sq_velocity is None:
-                    self._sq_velocity = torch.zeros_like(logits.float())
-                with torch.no_grad():
-                    result = _langevin_step_momentum(
-                        logits, self.eta, self.sigma, self.langevin_momentum,
-                        self._velocity, sq_velocity=self._sq_velocity,
-                        beta2=self.langevin_momentum_beta2 if self.langevin_momentum_beta2 > 0.0 else 0.999,
-                        top_k=self.top_k,
-                    )
-                    if self._sq_velocity is not None:
-                        logits, self._velocity, self._sq_velocity = result
-                    else:
-                        logits, self._velocity = result
-            else:
-                logits = _langevin_sample(
-                    logits, self.K, self.eta, self.sigma, top_k=self.top_k,
-                    eos_ids_tensor=self.langevin_eos_ids_tensor,
-                )
-
         with torch.no_grad():
             p_after = torch.softmax(logits.float(), dim=-1)
             # Keep H_after as a GPU tensor — defer .item() sync to update_state()
@@ -1518,7 +1331,7 @@ try:
                 computed_ent_threshold = fixed_ent_threshold
 
             # Adaptive t_min modes:
-            #   "static"   (or unset): use the static langevin_min_trigger_position.
+            #   "static"   (or unset): use the static langevin_tmin.
             #   "adaptive" (v19):      t_min = clamp(median(lengths) - W_min, floor, cap).
             #   "peak"     (v20):      t_min = clamp(alpha * historic_peak, floor, cap),
             #                          where historic_peak is a *monotonic* high-water
@@ -1530,12 +1343,12 @@ try:
             #                          the policy recovers and length climbs back over
             #                          t_min.  Replicates the manual "pump t_min up at
             #                          collapse onset" intervention that rescued v18b 1.7B.
-            _t_min_static = int(self._pivot_cfg.get("langevin_min_trigger_position", 0))
-            _t_min_mode = str(self._pivot_cfg.get("langevin_min_trigger_position_mode", "static")).lower()
+            _t_min_static = int(self._pivot_cfg.get("langevin_tmin", 0))
+            _t_min_mode = str(self._pivot_cfg.get("langevin_tmin_mode", "static")).lower()
             if _t_min_mode == "adaptive":
                 _t_min_window = int(self._pivot_cfg.get("langevin_t_min_window", 400))
-                _t_min_floor = int(self._pivot_cfg.get("langevin_t_min_floor", 400))
-                _t_min_cap = int(self._pivot_cfg.get("langevin_t_min_cap", 2500))
+                _t_min_floor = int(self._pivot_cfg.get("langevin_tmin", 400))
+                _t_min_cap = int(self._pivot_cfg.get("langevin_tmin_cap", 2500))
                 # Need at least ~64 completed rollouts for a stable median.
                 # Below that, fall back to the static floor.
                 if len(self._agg_response_lengths) >= 64:
@@ -1555,9 +1368,9 @@ try:
                 else:
                     _t_min_effective = _t_min_floor
             elif _t_min_mode == "peak":
-                _alpha = float(self._pivot_cfg.get("langevin_peak_alpha", 0.6))
-                _t_min_floor = int(self._pivot_cfg.get("langevin_t_min_floor", 200))
-                _t_min_cap = int(self._pivot_cfg.get("langevin_t_min_cap", 3200))
+                _alpha = float(self._pivot_cfg.get("langevin_tmin_peak_alpha", 0.6))
+                _t_min_floor = int(self._pivot_cfg.get("langevin_tmin", 200))
+                _t_min_cap = int(self._pivot_cfg.get("langevin_tmin_cap", 3200))
                 # Need ~64 completed rollouts before the peak is meaningful.
                 if len(self._agg_response_lengths) >= 64:
                     _buf = sorted(self._agg_response_lengths[-2000:])
@@ -1598,7 +1411,7 @@ try:
                 langevin_momentum=float(self._pivot_cfg.get("langevin_momentum", 0.0)),
                 langevin_momentum_beta2=float(self._pivot_cfg.get("langevin_momentum_beta2", 0.0)),
                 langevin_mala=bool(self._pivot_cfg.get("langevin_mala", False)),
-                langevin_min_trigger_position=_t_min_effective,
+                effective_tmin=_t_min_effective,
                 langevin_feedback=bool(self._pivot_cfg.get("langevin_feedback", False)),
                 langevin_exploit_ratio=float(self._pivot_cfg.get("langevin_exploit_ratio", 0.5)),
                 langevin_alpha_target=float(self._pivot_cfg.get("langevin_alpha_target", 0.0)),
@@ -1716,7 +1529,7 @@ try:
                         _H = _H_list[_bi]
                         _fire = (
                             _H > proc.entropy_threshold
-                            and proc._step >= proc.langevin_min_trigger_position
+                            and proc._step >= proc.effective_tmin
                         )
                         if _fire:
                             proc._do_G_update(_H)
@@ -2138,7 +1951,7 @@ try:
                 sigma=float(cfg.get("langevin_sigma", 0.01)),
                 top_k=int(cfg.get("langevin_top_k", 20)),
                 exploit_ratio=float(cfg.get("langevin_exploit_ratio", 0.6)),
-                min_trigger_position=int(cfg.get("langevin_min_trigger_position", 200)),
+                min_trigger_position=int(cfg.get("langevin_tmin", 200)),
                 alpha_target=float(cfg.get("langevin_alpha_target", 0.0)),
             )
 
@@ -2238,7 +2051,7 @@ try:
             cfg = self._pivot_cfg
             alpha_target = float(cfg.get("langevin_alpha_target", 0.0))
             gamma = float(cfg.get("langevin_momentum", 0.7))
-            min_trig_pos = int(cfg.get("langevin_min_trigger_position", 200))
+            min_trig_pos = int(cfg.get("langevin_tmin", 200))
 
             _cur_ent_thresh = float(active_procs[0].entropy_threshold)
             self._graph_ent_thresh.fill_(_cur_ent_thresh)

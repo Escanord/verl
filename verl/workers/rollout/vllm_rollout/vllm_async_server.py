@@ -645,7 +645,7 @@ class vLLMHttpServer:
                     extra_fields["lan_trigger_mask"] = _mask
                     extra_fields["lan_log_p_lan"] = _lp_list
             # When Langevin is configured but no trigger fired for this sample
-            # (e.g. response shorter than langevin_min_trigger_position), set
+            # (e.g. response shorter than effective_tmin), set
             # absent keys to None so all samples in the batch have uniform keys.
             # dp_actor.py already handles per-sample None values gracefully.
             extra_fields.setdefault("lan_trigger_mask", None)

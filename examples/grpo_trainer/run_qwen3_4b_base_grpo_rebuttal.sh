@@ -18,6 +18,11 @@ source /home/escanord/duy/venv-vault/miniconda3/etc/profile.d/conda.sh
 conda activate verl
 
 export VERL_FILE_LOGGER_ROOT=/home/escanord/duy/checkpoints/verl/grpo
+export VERL_VLLM_DISABLE_CASCADE_ATTN=1
+export VERL_VLLM_CUDAGRAPH_MODE=PIECEWISE
+export VLLM_FLASH_ATTN_VERSION=2
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+export HF_HOME=$HOME/duy/.cache/huggingface
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \

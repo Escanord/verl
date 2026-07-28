@@ -1390,37 +1390,14 @@ class DataParallelPPOActor(BasePPOActor):
         self._pivot_update_step += 1
         _pivot_cfg_train = getattr(self.config, "pivot", None) or {}
         _lan_grpo_coeff_train = float(_pivot_cfg_train.get("lan_grpo_coeff", 0.0))
-        # v13: correct IS denominator — patch old_log_prob instead of log_prob.
-        # adv*(log π_current - log p_lan_approx.detach()) at trigger positions.
-        _lan_grpo_correct_is = bool(_pivot_cfg_train.get("lan_grpo_correct_is", False))
         # Restrict pg_loss to Langevin-triggered positions only (exact alignment).
         # When True: response_mask = response_mask & lan_grpo_mask, so gradient
-        # flows only where Langevin fired — same set as the IS correction.
+        # flows only where Langevin fired.
         _lan_grpo_restrict_to_trigger = bool(_pivot_cfg_train.get("lan_grpo_restrict_to_trigger", False))
-        # v15: direct GRPO term at trigger positions.
-        # Adds λ*adv*(log π_current - log π_old) alongside the IS-corrected term.
-        # The IS-corrected denominator (p_lan_old) often causes ratio < 1-ε → PPO clip
-        # zeroes the gradient.  The direct term bypasses the clip (ratio ≈ 1) so
-        # π_current always gets a meaningful push at fork positions.
-        _lan_grpo_direct_coeff = float(_pivot_cfg_train.get("lan_grpo_direct_coeff", 0.0))
-        # v15b: blend IS denominator toward π_old instead of adding a separate direct term.
-        # old_log_prob[trig] = (1-w)*log_p_lan_old + w*log_π_old
-        # At w=0 → pure v13 (full IS). At w=1 → pure v4b (no IS). At w=0.5 the PPO
-        # clipping ratio π_current/denom stays close enough to 1 to avoid clip zeroing.
-        _lan_grpo_denom_blend = float(_pivot_cfg_train.get("lan_grpo_denom_blend", 0.0))
-        # v16: IS-corrected PPO as a pure additive term — main GRPO loss is never patched.
-        # total = GRPO(π/π_old) + λ × clip-PPO(π/p_lan_old) at trigger positions.
-        _lan_grpo_is_addon_coeff = float(_pivot_cfg_train.get("lan_grpo_is_addon_coeff", 0.0))
-        # v18: asymmetric IS — negative-advantage trigger positions use min(log_p_lan, log_π_old)
-        # as denominator so wrong committed paths are penalised at full GRPO strength.
-        _lan_grpo_asym_is = bool(_pivot_cfg_train.get("lan_grpo_asym_is", False))
-        # v21: soft IS correction as a per-token loss multiplier.
-        # Replaces the denominator patch entirely: PPO ratio stays π_θ/π_old (trust
-        # region intact), and the off-policy correction is applied by reweighting
-        # advantages at trigger positions by w = min(1, π_old/π_lan_old).
-        # Equivalent to multiplying per-token pg_loss by w because pg = -A·ratio.
-        # When True, all of (correct_is, denom_blend, asym_is, direct_coeff,
-        # is_addon_coeff) are ignored at trigger positions.
+        # Soft IS off-policy correction (DRIFT): the PPO ratio stays π_θ/π_old (trust
+        # region intact); the correction is a per-token advantage reweight
+        # w = min(1, π_old/π_lan_old) at trigger positions (pg = -A·ratio, so
+        # reweighting A is equivalent to reweighting pg).
         _lan_grpo_soft_is = bool(_pivot_cfg_train.get("lan_grpo_soft_is", False))
 
         # v21 IS-weight accumulators (rank-local, emitted once at the end of
@@ -1504,65 +1481,35 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             old_log_prob = model_inputs["old_log_probs"]
 
-                    _direct_old_log_prob = None
-                    if "lan_grpo_mask" in outputs and _lan_grpo_coeff_train > 0.0 and _lan_grpo_is_addon_coeff == 0.0:
+                    if "lan_grpo_mask" in outputs and _lan_grpo_coeff_train > 0.0 and _lan_grpo_soft_is:
+                        # Soft IS multiplier. PPO ratio stays π_θ/π_old; the off-policy
+                        # correction is a per-token weight w = min(1, π_old/π_lan_old) at
+                        # trigger positions, applied by reweighting advantages
+                        # (pg = -A·ratio → multiplying A is equivalent to multiplying pg).
+                        # No log_prob / old_log_prob patch — trust region stays intact and
+                        # we fall through to standard PPO with the reweighted advantages.
                         _lg_mask = outputs["lan_grpo_mask"].float()
-                        if _lan_grpo_soft_is:
-                            # v21: soft IS multiplier. PPO ratio stays π_θ/π_old; the
-                            # off-policy correction is applied as a per-token weight
-                            # w = min(1, π_old/π_lan_old) at trigger positions, by
-                            # reweighting advantages (pg = -A·ratio → multiplying A is
-                            # equivalent to multiplying pg).
-                            _log_p_lan = outputs["lan_grpo_log_p"]
-                            _log_pi_old = old_log_prob.detach()
-                            _log_w_v21 = (_log_pi_old - _log_p_lan).clamp(max=0.0)
-                            _w_corr_v21 = torch.exp(_log_w_v21)
-                            _is_weight_v21 = (1.0 - _lg_mask) + _w_corr_v21 * _lg_mask
-                            advantages = advantages * _is_weight_v21
-                            # Accumulate IS-weight stats into rank-local scalars;
-                            # emit once at the end of update_policy so the gathered
-                            # per-rank metric is a flat 8-element list (not ragged
-                            # 8×N_micro_batches that np.mean can't reduce when N
-                            # differs per rank — e.g. due to overlong-prompt drops).
-                            _trig_bool = _lg_mask.bool()
-                            if _trig_bool.any():
-                                _w_trig = _w_corr_v21[_trig_bool].float()
-                                _log_w_trig = _log_w_v21[_trig_bool].float()
-                                _v21_w_sum += _w_trig.sum().item()
-                                _v21_log_w_sum += _log_w_trig.sum().item()
-                                _v21_n_trig_total += int(_w_trig.numel())
-                                _v21_w_min = min(_v21_w_min, float(_w_trig.min().item()))
-                                # Reservoir-ish: cap at 4096 samples to bound memory.
-                                if len(_v21_samples) < 4096:
-                                    _v21_samples.extend(_w_trig.detach().cpu().tolist())
-                            # v21 disables the legacy IS-denominator patch; fall through
-                            # to standard PPO loss with the reweighted advantages.
-                        elif _lan_grpo_direct_coeff > 0.0:
-                            # v15: save pre-patch old_log_prob (= log π_old).
-                            # Used for direct term: adv*(log π_current - log π_old) at triggers.
-                            _direct_old_log_prob = old_log_prob.detach()
-                        if not _lan_grpo_soft_is and _lan_grpo_correct_is:
-                            # v13 correct IS: patch denominator (frozen) with log p_lan_approx.
-                            # adv*(log π_current - log p_lan_approx) at trigger positions.
-                            # Gradient flows only through log π_current (numerator).
-                            # v15b: optionally blend log_p_lan toward log_π_old so the PPO
-                            # clipping ratio stays closer to 1 (avoids clip zeroing gradients).
-                            _log_p_lan = outputs["lan_grpo_log_p"]
-                            _log_pi_old = old_log_prob.detach()
-                            _lan_denom = _log_p_lan
-                            if _lan_grpo_denom_blend > 0.0:
-                                _lan_denom = (1.0 - _lan_grpo_denom_blend) * _lan_denom + _lan_grpo_denom_blend * _log_pi_old
-                            if _lan_grpo_asym_is:
-                                # v18: negative-advantage trigger positions use min(log_p_lan, log_π_old)
-                                # as denominator.  Since p_lan >= π_old at committed tokens,
-                                # min = log_π_old → ratio recovers to standard GRPO strength.
-                                _neg_adv_trig = ((advantages < 0).float() * _lg_mask).bool()
-                                _lan_denom = torch.where(_neg_adv_trig, torch.min(_log_p_lan, _log_pi_old), _lan_denom)
-                            old_log_prob = old_log_prob * (1.0 - _lg_mask) + _lan_denom * _lg_mask
-                        else:
-                            # v12 lan_grpo: patch numerator with log p_lan_current.
-                            # adv*(log p_lan_current - log π_old) at trigger positions.
-                            log_prob = log_prob * (1.0 - _lg_mask) + outputs["lan_grpo_log_p"] * _lg_mask
+                        _log_p_lan = outputs["lan_grpo_log_p"]
+                        _log_pi_old = old_log_prob.detach()
+                        _log_w_v21 = (_log_pi_old - _log_p_lan).clamp(max=0.0)
+                        _w_corr_v21 = torch.exp(_log_w_v21)
+                        _is_weight_v21 = (1.0 - _lg_mask) + _w_corr_v21 * _lg_mask
+                        advantages = advantages * _is_weight_v21
+                        # Accumulate IS-weight stats into rank-local scalars; emit once at
+                        # the end of update_policy so the gathered per-rank metric is a flat
+                        # 8-element list (not ragged 8×N_micro_batches that np.mean can't
+                        # reduce when N differs per rank — e.g. due to overlong-prompt drops).
+                        _trig_bool = _lg_mask.bool()
+                        if _trig_bool.any():
+                            _w_trig = _w_corr_v21[_trig_bool].float()
+                            _log_w_trig = _log_w_v21[_trig_bool].float()
+                            _v21_w_sum += _w_trig.sum().item()
+                            _v21_log_w_sum += _log_w_trig.sum().item()
+                            _v21_n_trig_total += int(_w_trig.numel())
+                            _v21_w_min = min(_v21_w_min, float(_w_trig.min().item()))
+                            # Reservoir-ish: cap at 4096 samples to bound memory.
+                            if len(_v21_samples) < 4096:
+                                _v21_samples.extend(_w_trig.detach().cpu().tolist())
 
                     if _lan_grpo_restrict_to_trigger and "lan_grpo_mask" in outputs:
                         response_mask = response_mask * outputs["lan_grpo_mask"]
@@ -1613,55 +1560,6 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics.update(rollout_corr_metrics)
 
                     policy_loss = pg_loss
-
-                    # v15: direct GRPO term at trigger positions.
-                    # adv*(log π_current - log π_old) with ratio ≈ 1 → unclipped gradient.
-                    # IS term (v13) uses p_lan_old as denominator → ratio < 1-ε → PPO clip
-                    # can zero out gradients at exactly the positions that need them most.
-                    # This term restores a strong direct signal on π_current independently.
-                    if _lan_grpo_direct_coeff > 0.0 and _direct_old_log_prob is not None and "lan_grpo_mask" in outputs:
-                        _lg_mask_d = outputs["lan_grpo_mask"].float()
-                        _direct_loss_mat = -advantages * (log_prob - _direct_old_log_prob) * _lg_mask_d
-                        _direct_loss = agg_loss(
-                            loss_mat=_direct_loss_mat, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
-                        )
-                        policy_loss = policy_loss + _lan_grpo_direct_coeff * _direct_loss
-                        micro_batch_metrics["pivot/lan_grpo_direct_loss"] = _direct_loss.detach().item()
-
-                    # v16: IS-corrected PPO addon — main GRPO loss unpatched (ratio ≈ 1 everywhere).
-                    # Adds λ × clipped-PPO(π_current / p_lan_old) at trigger positions only.
-                    # When IS clips (ratio_IS > 1+ε or < 1-ε), main GRPO still delivers full gradient.
-                    # Dual-clip (clip_ratio_c) guards against A<0 positions where ratio_IS>>1
-                    # (tokens Langevin suppressed) causing unbounded positive loss.
-                    micro_batch_metrics["pivot/lan_grpo_is_addon_loss"] = float("nan")
-                    micro_batch_metrics["pivot/lan_grpo_is_clipfrac"] = float("nan")
-                    if _lan_grpo_is_addon_coeff > 0.0 and "lan_grpo_mask" in outputs:
-                        _lg_mask_is = outputs["lan_grpo_mask"].float()
-                        _lan_log_p_is = outputs["lan_grpo_log_p"]
-                        _clip_eps = float(self.config.clip_ratio)
-                        _clip_c = float(self.config.get("clip_ratio_c", 3.0))
-                        _is_kl = torch.clamp(log_prob - _lan_log_p_is, min=-20.0, max=20.0)
-                        _is_ratio = torch.exp(_is_kl)
-                        _is_pg1 = -advantages * _is_ratio
-                        _is_pg2 = -advantages * torch.clamp(_is_ratio, 1.0 - _clip_eps, 1.0 + _clip_eps)
-                        _is_clip1 = torch.maximum(_is_pg1, _is_pg2)
-                        # dual-clip: cap loss for A<0 tokens at clip_ratio_c (mirrors vanilla PPO)
-                        _is_pg3 = -advantages * _clip_c
-                        _is_clip2 = torch.min(_is_pg3, _is_clip1)
-                        _is_pg_losses = torch.where(advantages < 0, _is_clip2, _is_clip1) * _lg_mask_is
-                        _is_addon_loss = agg_loss(
-                            loss_mat=_is_pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
-                        )
-                        policy_loss = policy_loss + _lan_grpo_is_addon_coeff * _is_addon_loss
-                        micro_batch_metrics["pivot/lan_grpo_is_addon_loss"] = _is_addon_loss.detach().item()
-                        _trig_resp_mask = response_mask * _lg_mask_is
-                        _is_clipfrac = verl_F.masked_mean(
-                            torch.gt(_is_pg2, _is_pg1).float(), _trig_resp_mask.clamp(min=0)
-                        )
-                        micro_batch_metrics["pivot/lan_grpo_is_clipfrac"] = _is_clipfrac.item()
-                        micro_batch_metrics["pivot/lan_grpo_is_trig_frac"] = (
-                            _lg_mask_is.sum() / full_response_mask.float().sum().clamp(min=1)
-                        ).item()
 
                     if calculate_entropy and entropy is not None:
                         entropy_agg = agg_loss(loss_mat=entropy, loss_mask=full_response_mask, loss_agg_mode=loss_agg_mode)

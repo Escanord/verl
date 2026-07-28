@@ -898,10 +898,6 @@ class PIVOTv2RolloutProcessor:
         # None / empty = mask off (legacy behavior).
         self.langevin_eos_ids_tensor = langevin_eos_ids_tensor
 
-        # Set by PIVOTv2LangevinAdapter.apply() before each __call__
-        self._delta_var_current: float = 0.0
-        # v4: group mean logits set by adapter for group-mean perturbation
-        self._group_mean_logits: Optional[torch.Tensor] = None
         # Set at step 0 from token_ids; used by adapter to group concurrent rollouts
         self.prompt_hash: Optional[int] = None
 
@@ -1394,59 +1390,6 @@ try:
                 return logits
 
             sorted_reqs = sorted(self.req_info.items())
-
-            # ΔVar is only needed when NOT in entropy_trigger_only mode.
-            # When entropy_trigger_only=True each processor ignores _delta_var_current
-            # entirely, so computing it wastes ~128 .item() syncs per decode step.
-            _entropy_trigger_only = self._pivot_cfg.get("entropy_trigger_only", False)
-            if not _entropy_trigger_only:
-                # Compute ΔVar[t] from logit distributions across concurrent rollouts.
-                # Groups requests sharing the same prompt_hash (n=8 rollouts per prompt).
-                # At step 0 all rollouts share the same logits (identical prefix) so var=0
-                # and the entropy fallback handles the first token.  From step 1 onward,
-                # diverged rollouts produce different logit vectors and var > 0.
-                #
-                # Using raw logit variance (pre-softmax) avoids hooks entirely and is
-                # CUDA-graph compatible — no Python forward hooks needed.
-                groups: dict = {}
-                for req_idx, req_lp in sorted_reqs:
-                    proc = self._get_proc(req_lp)
-                    if proc is not None and proc.prompt_hash is not None:
-                        groups.setdefault(proc.prompt_hash, []).append(req_idx)
-
-                req_delta_vars: dict = {}
-                _use_group_mean = int(self._pivot_cfg.get("pivot_version", 2)) == 4
-                group_mean_logits: dict = {}  # prompt_hash -> mean logit tensor (v4 only)
-                with torch.no_grad():
-                    for ph, req_idxs in groups.items():
-                        if len(req_idxs) >= 2:
-                            logit_group = torch.stack(
-                                [logits[idx].float() for idx in req_idxs]
-                            )  # (n, vocab)
-                            # Masked vocab positions have -inf across ALL rollouts; their
-                            # cross-rollout variance is 0 by definition but -inf - (-inf)
-                            # = nan.  Replace non-finite entries with 0 before computing.
-                            logit_group = torch.where(
-                                torch.isfinite(logit_group),
-                                logit_group,
-                                torch.zeros_like(logit_group),
-                            )
-                            mean_l = logit_group.mean(0)  # (vocab,) — needed for variance
-                            var = ((logit_group - mean_l.unsqueeze(0)) ** 2).mean().item()
-                            if _use_group_mean:
-                                group_mean_logits[ph] = mean_l
-                        else:
-                            var = 0.0
-                        for idx in req_idxs:
-                            req_delta_vars[idx] = var
-
-                # Inject ΔVar and group mean into each processor before calling it
-                for req_idx, req_lp in sorted_reqs:
-                    proc = self._get_proc(req_lp)
-                    if proc is not None:
-                        proc._delta_var_current = req_delta_vars.get(req_idx, 0.0)
-                        ph = proc.prompt_hash
-                        proc._group_mean_logits = group_mean_logits.get(ph, None) if (ph is not None and _use_group_mean) else None
 
             # Batched NaN sanitization + entropy pre-computation for all active
             # sequences in one pass — reduces CPU-GPU syncs from N_seq per token

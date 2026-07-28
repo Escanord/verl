@@ -873,11 +873,8 @@ class PIVOTv2RolloutProcessor:
         langevin_sigma: float = 0.01,
         langevin_top_k: int = 0,
         pivot_version: int = 2,
-        adaptive_noise: bool = False,
         entropy_trigger_only: bool = False,
         langevin_momentum: float = 0.0,
-        langevin_momentum_beta2: float = 0.0,
-        langevin_mala: bool = False,
         effective_tmin: int = 0,
         langevin_feedback: bool = False,
         langevin_exploit_ratio: float = 0.5,
@@ -891,11 +888,8 @@ class PIVOTv2RolloutProcessor:
         self.sigma = langevin_sigma
         self.top_k = langevin_top_k
         self.pivot_version = pivot_version
-        self.adaptive_noise = adaptive_noise
         self.entropy_trigger_only = entropy_trigger_only
         self.langevin_momentum = langevin_momentum
-        self.langevin_momentum_beta2 = langevin_momentum_beta2
-        self.langevin_mala = langevin_mala
         self.effective_tmin = effective_tmin
         self.langevin_feedback = langevin_feedback
         self.langevin_exploit_ratio = langevin_exploit_ratio  # α: G-direction fraction in ε
@@ -929,20 +923,14 @@ class PIVOTv2RolloutProcessor:
         # update_state so dp_actor.py can skip the (n, n_trig, vocab) logit tensor.
         self._trigger_topk_logp: list = []  # list of (list[int], list[float]) — CPU
         self._lan_log_p_accum: list = []    # per-step log_p_lan cache (0.0 unresolved)
-        # MALA accept/reject counters (only meaningful when langevin_mala=True).
+        # MALA accept/reject counters (legacy; always 0 now, still summed by adapter).
         self._mala_accepted: int = 0
         self._mala_total: int = 0
-        # Momentum velocity and second moment — persist across trigger positions.
-        # None until the first trigger fires; naturally reset between sequences since
-        # PIVOTv2RolloutProcessor is instantiated once per generation request.
-        self._velocity: Optional[torch.Tensor] = None
-        self._sq_velocity: Optional[torch.Tensor] = None
         # Feedback-guided Langevin state (langevin_feedback=True only).
         # G: accumulated gradient estimate direction (full-vocab, cpu).
         # _prev_eps: noise vector applied at last triggered position (for G update).
         # _fb_triggered: True when we're waiting for next-step H to update G.
         self._G: Optional[torch.Tensor] = None
-        self._sq_G: Optional[torch.Tensor] = None   # Adam-RMS second moment for G
         self._prev_eps: Optional[torch.Tensor] = None
         self._fb_triggered: bool = False
         self._fb_signals: list = []     # per-trigger signal values for logging
@@ -1385,11 +1373,8 @@ try:
                 langevin_sigma=self._pivot_cfg.get("langevin_sigma", 0.01),
                 langevin_top_k=self._pivot_cfg.get("langevin_top_k", 0),
                 pivot_version=self._pivot_cfg.get("pivot_version", 2),
-                adaptive_noise=self._pivot_cfg.get("adaptive_noise", False),
                 entropy_trigger_only=self._pivot_cfg.get("entropy_trigger_only", False),
                 langevin_momentum=float(self._pivot_cfg.get("langevin_momentum", 0.0)),
-                langevin_momentum_beta2=float(self._pivot_cfg.get("langevin_momentum_beta2", 0.0)),
-                langevin_mala=bool(self._pivot_cfg.get("langevin_mala", False)),
                 effective_tmin=_t_min_effective,
                 langevin_feedback=bool(self._pivot_cfg.get("langevin_feedback", False)),
                 langevin_exploit_ratio=float(self._pivot_cfg.get("langevin_exploit_ratio", 0.5)),

@@ -338,14 +338,21 @@ class DataParallelPPOActor(BasePPOActor):
                                 "non_tensor_select_keys (dp_actor.py update_actor)."
                             )
 
+                        # Rollout-mask path is per-rollout (each rollout carries its own
+                        # trigger mask + IS denominator), so it needs no whole-group
+                        # alignment: use group size 1 and it works for ANY
+                        # ppo_micro_batch_size_per_gpu.  The ΔVar/Welford path still needs
+                        # the full n-rollout group to compute cross-rollout variance.
+                        _use_rollout_path = _rollout_trigger_raw is not None and _entropy_trigger_only
+                        _grp_size = 1 if _use_rollout_path else _n
                         _prereqs = (
                             _adv is not None
                             and _rmask is not None
-                            and batch_size % _n == 0
+                            and batch_size % _grp_size == 0
                         )
 
                         if _prereqs:
-                            _n_groups = batch_size // _n
+                            _n_groups = batch_size // _grp_size
                             _resp_lens = _rmask.sum(dim=-1).long()          # (B,)
                             _total_lens = attention_mask.sum(dim=-1).long()  # (B,)
                             _prompt_lens = _total_lens - _resp_lens          # (B,)
@@ -359,7 +366,7 @@ class DataParallelPPOActor(BasePPOActor):
                             _all_grp_var: list[torch.Tensor] = []  # for delta_var calibration logging
                             _all_grp_ent: list[torch.Tensor] = []  # for entropy calibration logging
                             for _g in range(_n_groups):
-                                _s, _e = _g * _n, (_g + 1) * _n
+                                _s, _e = _g * _grp_size, (_g + 1) * _grp_size
                                 _min_resp = int(_resp_lens[_s:_e].min().item())
                                 if _min_resp == 0:
                                     continue
@@ -435,7 +442,7 @@ class DataParallelPPOActor(BasePPOActor):
                                         _n_trig = _trig.numel()
                                         _trig_list = _trig.tolist()
                                         _log_p_lan_tok_rows = []
-                                        for _b_rel_lp in range(_n):
+                                        for _b_rel_lp in range(_grp_size):
                                             _b_g_lp = _s + _b_rel_lp
                                             _lp_row = _rollout_log_p_lan[_b_g_lp]
                                             _log_p_lan_tok_rows.append([
@@ -451,7 +458,7 @@ class DataParallelPPOActor(BasePPOActor):
                                         _valid_lg = _trig.unsqueeze(0) < _resp_lens[_s:_e].unsqueeze(1)
                                         if _rollout_trigger_raw is not None and _entropy_trigger_only:
                                             _per_rollout_valid = torch.zeros(
-                                                _n, _n_trig, dtype=torch.bool, device=_trig.device
+                                                _grp_size, _n_trig, dtype=torch.bool, device=_trig.device
                                             )
                                             for _b_rel_lg, _b_g_lg in enumerate(range(_s, _e)):
                                                 _rm_lg = _rollout_trigger_raw[_b_g_lg]

@@ -61,6 +61,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
+    +actor_rollout_ref.rollout.pivot.pivot_version=2 \
     +actor_rollout_ref.rollout.pivot.langevin_rollout=True \
     +actor_rollout_ref.rollout.pivot.entropy_trigger_only=True \
     +actor_rollout_ref.rollout.pivot.trig_percentile=85 \
@@ -76,6 +77,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.pivot.langevin_feedback=True \
     +actor_rollout_ref.rollout.pivot.langevin_exploit_ratio=0.9 \
     +actor_rollout_ref.rollout.pivot.langevin_alpha_target=0.7 \
+    +actor_rollout_ref.actor.pivot.pivot_version=2 \
     +actor_rollout_ref.actor.pivot.lan_grpo_coeff=1.0 \
     +actor_rollout_ref.actor.pivot.lan_grpo_soft_is=True \
     +actor_rollout_ref.actor.pivot.n_rollouts_per_prompt=8 \

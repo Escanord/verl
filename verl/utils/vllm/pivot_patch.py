@@ -81,6 +81,7 @@ _pivot_decode_state = _PIVOTDecodeState()
 _TRIGGER_REGISTRY: dict = {}
 
 
+
 def _reset_pivot_state():
     """Reset the module-level decode state (call before each generation batch)."""
     s = _pivot_decode_state
@@ -205,6 +206,7 @@ def _langevin_step_feedback(
     G: Optional[torch.Tensor],
     alpha: float,
     eos_ids_tensor: Optional[torch.Tensor] = None,
+    noise: Optional[torch.Tensor] = None,
 ) -> tuple:
     """Langevin step with G-guided adaptive noise. No entropy-gradient drift.
 
@@ -237,7 +239,8 @@ def _langevin_step_feedback(
     # Python norm-guard branches (syncs 2-4). active_mask.float().sum().sqrt()
     # stays on GPU as a 0-dim tensor; Python never sees the scalar.
     active_f = active_mask.float()
-    random_eps = torch.randn_like(logits.float()).mul_(active_f)
+    _base_noise = noise if noise is not None else torch.randn_like(logits.float())
+    random_eps = _base_noise.to(logits.device, torch.float32).mul(active_f)
     random_eps = random_eps / random_eps.norm().clamp(min=1e-8)
 
     # Mix G direction with random
@@ -267,6 +270,7 @@ def _langevin_step_feedback_batched(
     G: torch.Tensor,       # (N, vocab) — zeros where G is absent
     alpha: float,
     eos_ids_tensor: Optional[torch.Tensor] = None,
+    noise: Optional[torch.Tensor] = None,
 ) -> tuple:
     """Batched version of _langevin_step_feedback for N triggered sequences.
 
@@ -290,7 +294,8 @@ def _langevin_step_feedback_batched(
     active_f = (~inf_mask).float()               # (N, vocab)
 
     # One randn for all N sequences — single large kernel vs N small ones.
-    random_eps = torch.randn_like(logits.float()).mul_(active_f)
+    _base_noise = noise if noise is not None else torch.randn_like(logits.float())
+    random_eps = _base_noise.to(logits.device, torch.float32).mul(active_f)
     row_norm = random_eps.norm(dim=-1, keepdim=True).clamp(min=1e-8)
     random_eps = random_eps / row_norm
 
@@ -1000,20 +1005,13 @@ class PIVOTv2RolloutProcessor:
         self._step_delta_vars.append(_step_trig_val if fire else 0.0)
 
         if not fire:
-            if self._example is None:
-                with torch.no_grad():
-                    p = torch.softmax(logits.float(), dim=-1)
-                    topk = torch.topk(p, 5)
-                # Reuse H from trigger-determination (avoids .item() sync).
-                H_nt = H if H is not None else float(
-                    -(p * torch.log(p.clamp(min=1e-12))).sum().item()
-                )
-                self._recent_non_trigger.append({
-                    "step": step, "topk_ids": topk.indices.tolist(),
-                    "topk_probs": topk.values.tolist(), "H": H_nt,
-                })
-                if len(self._recent_non_trigger) > 5:
-                    self._recent_non_trigger.pop(0)
+            # Non-triggered token: nothing to do. (The old per-token non-trigger
+            # diagnostic — full-vocab softmax+topk+tolist to capture context for a
+            # one-shot debug print — was removed: it profiled as ~65% of worker
+            # time at 16k because its self-limit only fired on request completion,
+            # which never happens during a 16k generation ramp. It fed no training
+            # signal. Aggregate stats [trig_frac, H_before/after, feedback, entropy
+            # /ΔVar dists] come from separate buffers and are unaffected.)
             return logits
 
         self._trigger_count += 1
@@ -1084,24 +1082,41 @@ class PIVOTv2RolloutProcessor:
                     )
             self._prev_eps = _eps  # keep on GPU alongside _G
             self._fb_triggered = True
+        # IS top-k log(p_lan) + H_after: prefer the values the batched pre-pass
+        # computed for all triggered rows in one GPU pass (bit-identical to the
+        # per-request path; validated by test_pivot_vectorization.py).  Only the
+        # fallback path (batched pre-pass skipped/failed) does the per-request
+        # full-vocab softmax/topk/.cpu() here.
+        _precomp_is = getattr(self, '_precomputed_is', None)
+        self._precomputed_is = None  # consume
+        _precomp_Ha = getattr(self, '_precomputed_H_after', None)
+        self._precomputed_H_after = None  # consume
+        p_after = None  # computed lazily below only if the diagnostic needs it
         with torch.no_grad():
-            p_after = torch.softmax(logits.float(), dim=-1)
-            # Keep H_after as a GPU tensor — defer .item() sync to update_state()
-            # (called once per completed request, not once per decode step).
-            H_after_t = -(p_after * torch.log(p_after.clamp(min=1e-12))).sum()
-            # Store GPU tensors for topk log(p_lan) — defer .cpu().tolist() to
-            # update_state() so we avoid N_trig CPU round-trips per decode step.
-            _lp = torch.log_softmax(logits.float(), dim=-1)
-            _fin = torch.isfinite(_lp)
-            _topk_ids = _fin.nonzero(as_tuple=True)[0]
-            self._trigger_topk_logp.append(
-                (_topk_ids.cpu().tolist(), _lp[_topk_ids].cpu().tolist())
-            )
+            if _precomp_is is not None:
+                # Batched pre-pass already produced IS top-k + H_after.
+                self._trigger_topk_logp.append(_precomp_is)
+                H_after_t = _precomp_Ha  # GPU scalar; converted in update_state()
+            else:
+                p_after = torch.softmax(logits.float(), dim=-1)
+                # Keep H_after as a GPU tensor — defer .item() to update_state().
+                H_after_t = -(p_after * torch.log(p_after.clamp(min=1e-12))).sum()
+                # IS denominator: only the top-K log-probs of p_lan are needed
+                # (the sampled token concentrates there after perturbation).
+                _lp = torch.log_softmax(logits.float(), dim=-1)
+                _k = int(getattr(self, "top_k", 20) or 20)
+                _k = max(1, min(_k, _lp.numel()))
+                _tv, _ti = torch.topk(_lp, _k)
+                self._trigger_topk_logp.append(
+                    (_ti.cpu().tolist(), _tv.cpu().tolist())
+                )
 
         self._entropy_before.append(H_before)
         self._entropy_after.append(H_after_t)  # GPU tensor; converted in update_state()
 
         if self._example and "topk_ids_after" not in self._example:
+            if p_after is None:
+                p_after = torch.softmax(logits.float(), dim=-1)
             topk_after = torch.topk(p_after, 5)
             self._example["topk_ids_after"] = topk_after.indices.tolist()
             self._example["topk_probs_after"] = topk_after.values.tolist()
@@ -1389,10 +1404,17 @@ try:
             _H_list = None
             try:
                 with torch.no_grad():
-                    _idx_t = torch.tensor(
-                        [idx for idx, _ in sorted_reqs],
-                        dtype=torch.long, device=logits.device,
-                    )
+                    # Cache the CUDA index tensor across steps: building it from a
+                    # Python list every decode step was ~33% of worker time
+                    # (profiled). The active-request set is stable for long
+                    # stretches, so rebuild only when it changes.
+                    _idxs = [idx for idx, _ in sorted_reqs]
+                    if getattr(self, "_cached_idx_list", None) != _idxs:
+                        self._cached_idx_list = _idxs
+                        self._cached_idx_t = torch.tensor(
+                            _idxs, dtype=torch.long, device=logits.device,
+                        )
+                    _idx_t = self._cached_idx_t
                     _active = logits[_idx_t].float()
                     # Sanitize NaN in-place on the gathered slice — nan_to_num is a
                     # Unconditional nan_to_num — no GPU sync (pure CUDA kernel).
@@ -1420,7 +1442,8 @@ try:
             )
             if _do_batched_lan:
                 try:
-                    _trig_infos = []  # (sorted_idx, req_idx, proc, H)
+                    _trig_infos = []  # (sorted_idx, req_idx, proc)
+                    _H_trig = []      # H_before per triggered proc (parallel list)
                     for _bi, (req_idx, req_lp) in enumerate(sorted_reqs):
                         proc = self._get_proc(req_lp)
                         if proc is None or not proc.langevin_feedback:
@@ -1431,8 +1454,10 @@ try:
                             and proc._step >= proc.effective_tmin
                         )
                         if _fire:
-                            proc._do_G_update(_H)
+                            # G-update is done BATCHED below (was a per-proc GPU
+                            # op loop, profiled ~7.4% of worker time).
                             _trig_infos.append((_bi, req_idx, proc))
+                            _H_trig.append(_H)
 
                     if _trig_infos:
                         _vocab = logits.shape[-1]
@@ -1443,15 +1468,62 @@ try:
                         )
                         _trig_logits = logits[_trig_req_idxs].float()  # (N_trig, vocab)
 
-                        # Stack G tensors — zeros for procs with no G yet.
-                        _G_stack = torch.zeros(_n_trig, _vocab, device=logits.device)
                         _proc0 = _trig_infos[0][2]
                         _sigma = _proc0.sigma
                         _top_k = _proc0.top_k
                         _exploit = _proc0.langevin_exploit_ratio
+
+                        # Batched G momentum update (was _do_G_update() per proc —
+                        # two full-vocab (V,) ops launched serially per triggered
+                        # proc, profiled ~7.4% of worker time). Same v18 target-band
+                        # feedback math, validated bit-identical by
+                        # examples/empirical/test_pivot_vectorization.py. Only procs
+                        # with a PRIOR perturbation (_fb_triggered) and a recorded
+                        # H_first update G; the rest keep G unchanged (torch.where
+                        # gate — decaying non-updated slots would be a bug). The
+                        # updated stack is reused directly as the perturbation's G.
+                        _gamma = _proc0.langevin_momentum if _proc0.langevin_momentum > 0.0 else 0.7
+                        _alpha_t = _proc0.langevin_alpha_target
+                        _G_stack = torch.zeros(_n_trig, _vocab, device=logits.device)
+                        _pe_stack = torch.zeros(_n_trig, _vocab, device=logits.device)
+                        _sig_list = []
+                        _upd_list = []
                         for _j, (_, _, _proc) in enumerate(_trig_infos):
                             if _proc._G is not None:
                                 _G_stack[_j] = _proc._G.to(logits.device)
+                            _updatable = bool(
+                                _proc.langevin_feedback and _proc._fb_triggered
+                                and _proc._prev_eps is not None and _proc._entropy_before
+                            )
+                            _upd_list.append(_updatable)
+                            if _updatable:
+                                _sig_list.append(
+                                    _H_trig[_j] - _proc._entropy_before[0] * _alpha_t
+                                )
+                                _pe_stack[_j] = _proc._prev_eps.to(logits.device)
+                            else:
+                                _sig_list.append(0.0)
+                        with torch.no_grad():
+                            _sig_t = torch.tensor(
+                                _sig_list, device=logits.device, dtype=torch.float32,
+                            ).unsqueeze(1)
+                            _upd_t = torch.tensor(
+                                _upd_list, device=logits.device, dtype=torch.bool,
+                            ).unsqueeze(1)
+                            _feedback = _sig_t * _pe_stack
+                            _G_stack = torch.where(
+                                _upd_t,
+                                _gamma * _G_stack + (1.0 - _gamma) * _feedback,
+                                _G_stack,
+                            )
+                        # Scatter updated G back to each proc + reset flags exactly
+                        # like _do_G_update() did (per-proc reads are the same order).
+                        for _j, (_, _, _proc) in enumerate(_trig_infos):
+                            _proc._G = _G_stack[_j]
+                            _proc._G_updated = True
+                            _proc._fb_triggered = False
+                            if _upd_list[_j]:
+                                _proc._fb_signals.append(_sig_list[_j])
 
                         # One batched Langevin call for all N_trig sequences.
                         # All procs in the same batch share the same EOS mask tensor
@@ -1467,9 +1539,36 @@ try:
                         # (OOM etc.), no eps are injected and __call__() falls back to
                         # per-request Langevin on the original logits — correct fallback.
                         # If scatter succeeds, all procs get eps before the loop runs.
-                        logits[_trig_req_idxs] = _new_trig_logits.to(logits.dtype)
+                        _stored = _new_trig_logits.to(logits.dtype)
+                        logits[_trig_req_idxs] = _stored
+
+                        # Batched post-perturbation recording: IS top-k log(p_lan)
+                        # + H_after for ALL triggered rows in one GPU pass + one
+                        # bulk .cpu(), replacing N_trig serial full-vocab
+                        # softmax/log_softmax/topk/.cpu() calls in the per-request
+                        # loop (profiled as the dominant remaining rollout cost).
+                        # Computed from the bf16-rounded stored logits so it is
+                        # bit-identical to the per-request path (validated by
+                        # examples/empirical/test_pivot_vectorization.py).
+                        with torch.no_grad():
+                            _stored_f = _stored.float()
+                            _k_is = int(getattr(_proc0, "top_k", 20) or 20)
+                            _k_is = max(1, min(_k_is, _stored_f.shape[-1]))
+                            _lp_b = torch.log_softmax(_stored_f, dim=-1)
+                            _is_vals_b, _is_ids_b = torch.topk(_lp_b, _k_is, dim=-1)
+                            _p_after_b = torch.softmax(_stored_f, dim=-1)
+                            _H_after_b = -(
+                                _p_after_b * torch.log(_p_after_b.clamp(min=1e-12))
+                            ).sum(dim=-1)
+                            # One bulk transfer for IS (the per-step registry flush
+                            # needs Python lists); H_after stays on GPU (deferred
+                            # to update_state — one sync per completed request).
+                            _is_ids_cpu = _is_ids_b.cpu().tolist()
+                            _is_vals_cpu = _is_vals_b.cpu().tolist()
                         for _j, (_, _, _proc) in enumerate(_trig_infos):
                             _proc._precomputed_eps = _eps_batch[_j]
+                            _proc._precomputed_is = (_is_ids_cpu[_j], _is_vals_cpu[_j])
+                            _proc._precomputed_H_after = _H_after_b[_j]
                 except Exception:
                     pass  # fall back to per-request path on any error
 

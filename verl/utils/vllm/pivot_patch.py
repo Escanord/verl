@@ -884,6 +884,9 @@ class PIVOTv2RolloutProcessor:
         langevin_exploit_ratio: float = 0.5,
         langevin_alpha_target: float = 0.0,
         langevin_eos_ids_tensor: Optional[torch.Tensor] = None,
+        neff_trigger: bool = False,
+        neff_min: float = 2.0,
+        neff_max: float = 8.0,
     ):
         self.delta_var_threshold = delta_var_threshold
         self.entropy_threshold = entropy_threshold
@@ -900,6 +903,14 @@ class PIVOTv2RolloutProcessor:
         # v19: EOS-class token ids masked from the Langevin top-K subspace.
         # None / empty = mask off (legacy behavior).
         self.langevin_eos_ids_tensor = langevin_eos_ids_tensor
+        # N_eff band trigger (replaces entropy-threshold + tmin when enabled).
+        # Fire iff neff_min <= N_eff <= neff_max, N_eff = 1/Σp² = effective number
+        # of comparable next-token choices. Floor = "a real fork"; ceiling = rollout
+        # count n (fork is coverable by n rollouts + nudge stays on-policy).
+        # Position-agnostic — no tmin gate.
+        self.neff_trigger = neff_trigger
+        self.neff_min = neff_min
+        self.neff_max = neff_max
 
         # Set at step 0 from token_ids; used by adapter to group concurrent rollouts
         self.prompt_hash: Optional[int] = None
@@ -911,6 +922,8 @@ class PIVOTv2RolloutProcessor:
         self._entropy_before: list = []
         self._entropy_after: list = []
         self._entropy_all: list = []    # every 4th position for calibration
+        self._neff_all: list = []       # N_eff samples (every 4th) for band calibration
+        self._neff_topk: list = []      # top-k prob profile at fired tokens (calibration)
         self._delta_vars_seen: list = []  # every 4th position for calibration
         self._example = None
         self._recent_non_trigger: list = []  # rolling 5-entry context buffer
@@ -992,10 +1005,24 @@ class PIVOTv2RolloutProcessor:
                     H = -(p * torch.log(p.clamp(min=1e-12))).sum().item()
             if step % 4 == 0 and step >= self.effective_tmin:
                 self._entropy_all.append(H)
-            fire = H > self.entropy_threshold
+            if self.neff_trigger:
+                # N_eff band trigger (consistent with the batched pre-pass; reads the
+                # precomputed value so both fire sites agree on the same token).
+                _Neff_c = getattr(self, '_precomputed_Neff', None)
+                self._precomputed_Neff = None
+                if _Neff_c is None:
+                    with torch.no_grad():
+                        _pc = torch.softmax(logits.float(), dim=-1)
+                        _Neff_c = float(1.0 / (_pc * _pc).sum().clamp(min=1e-12))
+                if step % 4 == 0:
+                    self._neff_all.append(_Neff_c)  # calibration
+                fire = (self.neff_min <= _Neff_c <= self.neff_max)
+            else:
+                fire = H > self.entropy_threshold
             trigger_mode = "entropy"
             _step_trig_val = H  # tentative; zeroed below if position guard suppresses
-        if fire and self.effective_tmin > 0 and step < self.effective_tmin:
+        # Position (tmin) guard — skipped in N_eff mode (band is position-agnostic).
+        if fire and not self.neff_trigger and self.effective_tmin > 0 and step < self.effective_tmin:
             fire = False
 
         # Append AFTER the position guard so the mask only reflects triggers that
@@ -1030,6 +1057,11 @@ class PIVOTv2RolloutProcessor:
             else:
                 p_before = torch.softmax(logits.float(), dim=-1)
                 H_before = -(p_before * torch.log(p_before.clamp(min=1e-12))).sum().item()
+            # Calibration: record the top-k prob profile at fired tokens so we can see
+            # the fork shape the N_eff band is actually firing on. Capped to bound cost.
+            if self.neff_trigger and len(self._neff_topk) < 256:
+                _tk = torch.topk(p_before, min(8, p_before.numel())).values
+                self._neff_topk.append([round(float(v), 4) for v in _tk.tolist()])
 
         # G update: fires at the next trigger (not t+1). H_before of this trigger
         # is the measurement used to update G momentum.
@@ -1189,6 +1221,8 @@ try:
             self._agg_trigger_fracs: list = []
             self._agg_n_completed: int = 0
             self._agg_entropy_all: list = []
+            self._agg_neff_all: list = []      # N_eff samples for band calibration
+            self._agg_neff_topk: list = []     # top-k prob profiles at fired tokens
             self._agg_delta_vars: list = []
             self._agg_fb_signals: list = []  # feedback signal values across all requests
             # v19: rolling response-length buffer for adaptive t_min.
@@ -1383,6 +1417,9 @@ try:
                 langevin_exploit_ratio=float(self._pivot_cfg.get("langevin_exploit_ratio", 0.5)),
                 langevin_alpha_target=float(self._pivot_cfg.get("langevin_alpha_target", 0.0)),
                 langevin_eos_ids_tensor=self._eos_ids_tensor,
+                neff_trigger=bool(self._pivot_cfg.get("langevin_neff_trigger", False)),
+                neff_min=float(self._pivot_cfg.get("langevin_neff_min", 2.0)),
+                neff_max=float(self._pivot_cfg.get("langevin_neff_max", 8.0)),
             )
 
         def is_argmax_invariant(self) -> bool:
@@ -1422,12 +1459,16 @@ try:
                     _active.nan_to_num_(nan=float('-inf'))
                     _p_all = torch.softmax(_active, dim=-1)
                     _H_list = (-(_p_all * torch.log(_p_all.clamp(min=1e-12))).sum(dim=-1)).tolist()
+                    # N_eff = 1/Σp² = effective number of comparable choices (for the
+                    # band trigger). Cheaper than entropy (no log); reuses _p_all.
+                    _Neff_list = (1.0 / (_p_all * _p_all).sum(dim=-1).clamp(min=1e-12)).tolist()
                 _p_list = _p_all.unbind(0)  # list of (vocab,) views, no copy
-                for (_, req_lp), H_pre, p_pre in zip(sorted_reqs, _H_list, _p_list):
+                for (_, req_lp), H_pre, p_pre, Neff_pre in zip(sorted_reqs, _H_list, _p_list, _Neff_list):
                     proc = self._get_proc(req_lp)
                     if proc is not None:
                         proc._precomputed_H = H_pre
                         proc._precomputed_p = p_pre  # reused at trigger to skip softmax
+                        proc._precomputed_Neff = Neff_pre
             except Exception:
                 pass  # fall back to per-request .item() computation
 
@@ -1449,10 +1490,16 @@ try:
                         if proc is None or not proc.langevin_feedback:
                             continue
                         _H = _H_list[_bi]
-                        _fire = (
-                            _H > proc.entropy_threshold
-                            and proc._step >= proc.effective_tmin
-                        )
+                        if proc.neff_trigger:
+                            # Band on effective #choices: fire on a genuine, coverable
+                            # fork (neff_min ≤ N_eff ≤ neff_max). No tmin gate.
+                            _Neff = _Neff_list[_bi]
+                            _fire = (proc.neff_min <= _Neff <= proc.neff_max)
+                        else:
+                            _fire = (
+                                _H > proc.entropy_threshold
+                                and proc._step >= proc.effective_tmin
+                            )
                         if _fire:
                             # G-update is done BATCHED below (was a per-proc GPU
                             # op loop, profiled ~7.4% of worker time).
@@ -1699,6 +1746,10 @@ try:
                     self._agg_H_after.extend(_H_after_floats)
                     if proc._entropy_all:
                         self._agg_entropy_all.extend(proc._entropy_all)
+                    if getattr(proc, "_neff_all", None):
+                        self._agg_neff_all.extend(proc._neff_all)
+                    if getattr(proc, "_neff_topk", None):
+                        self._agg_neff_topk.extend(proc._neff_topk)
                     if proc._delta_vars_seen:
                         self._agg_delta_vars.extend(proc._delta_vars_seen)
                     if proc._fb_signals:
@@ -1801,6 +1852,36 @@ try:
                                 f"threshold={eth:.1f} frac_above={sum(1 for h in ent_s if h > eth) / n:.3f}",
                                 flush=True,
                             )
+                    # N_eff distribution — calibration for the band [neff_min, neff_max]
+                    if self._agg_neff_all:
+                        ne = sorted(self._agg_neff_all[-4000:])
+                        m = len(ne)
+                        _nmin = float(self._pivot_cfg.get("langevin_neff_min", 2.0))
+                        _nmax = float(self._pivot_cfg.get("langevin_neff_max", 8.0))
+                        _fin = sum(1 for x in ne if _nmin <= x <= _nmax) / m
+                        _fbelow = sum(1 for x in ne if x < _nmin) / m
+                        _fabove = sum(1 for x in ne if x > _nmax) / m
+                        print(
+                            f"PIVOT-v2 N_eff dist | n={m} | "
+                            f"p50={ne[m // 2]:.2f} p80={ne[int(m * 0.80)]:.2f} "
+                            f"p90={ne[int(m * 0.90)]:.2f} p95={ne[int(m * 0.95)]:.2f} | "
+                            f"band=[{_nmin:.1f},{_nmax:.1f}] frac_in={_fin:.3f} "
+                            f"frac_below={_fbelow:.3f} frac_above={_fabove:.3f}",
+                            flush=True,
+                        )
+                    # top-k prob profile at fired tokens — shows the fork shape fired on
+                    if self._agg_neff_topk:
+                        _prof = self._agg_neff_topk[-256:]
+                        _kmax = max(len(r) for r in _prof)
+                        _means = []
+                        for _j in range(_kmax):
+                            _vals = [r[_j] for r in _prof if len(r) > _j]
+                            _means.append(sum(_vals) / len(_vals) if _vals else 0.0)
+                        print(
+                            f"PIVOT-v2 fired top-k prob | n={len(_prof)} | mean p1..p{_kmax}=["
+                            + ",".join(f"{x:.3f}" for x in _means) + "]",
+                            flush=True,
+                        )
             else:
                 _new_req_tok_refs = {}
                 _new_slot_reqids = {}
@@ -1820,6 +1901,8 @@ try:
                             _idx = max(0, min(_idx, len(_buf) - 1))
                             self._warmup_ent_threshold = _buf[_idx]
                         self._agg_entropy_all = []
+                        self._agg_neff_all = []
+                        self._agg_neff_topk = []
                         self._agg_delta_vars = []
                         self._agg_fb_signals = []
                         self._adaptive_ent_logged = False

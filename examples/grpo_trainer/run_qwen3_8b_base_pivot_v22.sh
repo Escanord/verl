@@ -107,7 +107,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","file"]' \
     trainer.project_name='verl_pivot_v22_qwen3_guru_rl' \
-    trainer.experiment_name='qwen3_8b_base_pivot_v22' \
+    trainer.experiment_name="qwen3_8b_base_pivot_v22_${SLURM_JOB_ID:-manual}" \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \

@@ -1406,6 +1406,12 @@ class DataParallelPPOActor(BasePPOActor):
         # w = min(1, π_old/π_lan_old) at trigger positions (pg = -A·ratio, so
         # reweighting A is equivalent to reweighting pg).
         _lan_grpo_soft_is = bool(_pivot_cfg_train.get("lan_grpo_soft_is", False))
+        # Ceiling on the soft-IS weight: w = min(wmax, π_old/π_lan_old).
+        # Default 1.0 = original truncated IS (one-sided down-weight, bounds
+        # variance, biases conservatively toward GRPO). wmax>1 keeps some
+        # up-weighting while still capping the tail variance. wmax<=0 disables
+        # the ceiling (exact but unbounded-variance w — blows up, do not use).
+        _lan_grpo_softis_wmax = float(_pivot_cfg_train.get("lan_grpo_softis_wmax", 1.0))
 
         # v21 IS-weight accumulators (rank-local, emitted once at the end of
         # update_policy so each rank contributes a single scalar per metric and
@@ -1447,6 +1453,7 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
                     entropy_top_ratio = self.config.get("entropy_top_ratio", None)
+                    entropy_top_union_trigger = bool(self.config.get("entropy_top_union_trigger", False))
 
                     calculate_entropy = (
                         self.config.calculate_entropy or (entropy_coeff != 0) or (entropy_top_ratio is not None)
@@ -1468,16 +1475,21 @@ class DataParallelPPOActor(BasePPOActor):
                     # response tokens by per-token entropy from the current policy.
                     # Adapted from Wang et al., "Beyond the 80/20 Rule", NeurIPS 2025.
                     # https://arxiv.org/abs/2506.01939
+                    entropy_top_mask = None
                     if entropy_top_ratio is not None and entropy is not None:
                         entropy_top_mask = get_global_entropy_top_mask(
                             entropy=entropy,
                             response_mask=response_mask,
                             top_ratio=entropy_top_ratio,
                         )
-                        response_mask = response_mask * entropy_top_mask
-                        micro_batch_metrics["actor/high_ent_token_frac"] = (
-                            response_mask.sum() / model_inputs["response_mask"].float().sum().clamp(min=1)
-                        ).item()
+                        if not entropy_top_union_trigger:
+                            # Intersection (default): gradient only on top-ρ entropy tokens.
+                            response_mask = response_mask * entropy_top_mask
+                            micro_batch_metrics["actor/high_ent_token_frac"] = (
+                                response_mask.sum() / model_inputs["response_mask"].float().sum().clamp(min=1)
+                            ).item()
+                        # else: union with the Langevin trigger mask is applied below, once
+                        # outputs["lan_grpo_mask"] is available (see the mx+heg_union block).
 
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -1498,7 +1510,10 @@ class DataParallelPPOActor(BasePPOActor):
                         _lg_mask = outputs["lan_grpo_mask"].float()
                         _log_p_lan = outputs["lan_grpo_log_p"]
                         _log_pi_old = old_log_prob.detach()
-                        _log_w_v21 = (_log_pi_old - _log_p_lan).clamp(max=0.0)
+                        _log_w_v21 = _log_pi_old - _log_p_lan
+                        if _lan_grpo_softis_wmax > 0.0:
+                            import math
+                            _log_w_v21 = _log_w_v21.clamp(max=math.log(_lan_grpo_softis_wmax))
                         _w_corr_v21 = torch.exp(_log_w_v21)
                         _is_weight_v21 = (1.0 - _lg_mask) + _w_corr_v21 * _lg_mask
                         advantages = advantages * _is_weight_v21
@@ -1528,6 +1543,22 @@ class DataParallelPPOActor(BasePPOActor):
                     if _fork_alpha > 0.0 and "lan_grpo_mask" in outputs:
                         _fork_mask = outputs["lan_grpo_mask"].float()
                         advantages = advantages * (1.0 + _fork_alpha * _fork_mask)
+
+                    # mx+heg_union: gradient acts on (top-ρ entropy tokens) ∪ (Langevin
+                    # trigger tokens). DRIFT's N_eff∈[2,8] triggers target moderate-choice
+                    # tokens that can fall below heg's top-ρ entropy cutoff; the default
+                    # intersection zeros their soft-IS-corrected gradient. Union keeps both.
+                    if entropy_top_union_trigger and entropy_top_mask is not None:
+                        _trig_union_mask = (
+                            outputs["lan_grpo_mask"].bool()
+                            if "lan_grpo_mask" in outputs
+                            else torch.zeros_like(entropy_top_mask, dtype=torch.bool)
+                        )
+                        _union_mask = (entropy_top_mask.bool() | _trig_union_mask).to(full_response_mask.dtype)
+                        response_mask = full_response_mask * _union_mask
+                        micro_batch_metrics["actor/high_ent_token_frac"] = (
+                            response_mask.sum() / model_inputs["response_mask"].float().sum().clamp(min=1)
+                        ).item()
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla

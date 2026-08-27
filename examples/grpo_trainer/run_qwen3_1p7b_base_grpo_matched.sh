@@ -1,30 +1,24 @@
 #!/usr/bin/env bash
-# DRIFT-v22 on Qwen3-4B-Base, guru_rl math — main training script.
-# Matched 1:1 to the GRPO baseline so the only difference is DRIFT on/off:
-# identical data / reward (strict-box \boxed{}) / batch 1024 / KL, symmetric
-# clip 0.2/0.2, use_kl_in_reward=False.
-#   - soft-IS off-policy correction (lan_grpo_soft_is=True): PPO ratio stays
-#     π_θ/π_old, correction via advantage reweight w=min(1,π_old/π_lan_old).
-#   - PEAK trigger gate variant: langevin_tmin_mode=peak, floor=400, cap=3200,
-#     peak_alpha=0.6. effective_tmin = clamp(0.6*monotonic_peak_median, 400, 3200),
-#     recomputed per step. (The earlier "peak never fired at 16k" was actually the
-#     pivot_version-missing adapter bug — nothing fired in any mode; retesting peak.)
-#   - langevin_top_k=128, langevin_exploit_ratio=1.0
+# Vanilla GRPO on Qwen3-1.7B-Base — matched baseline for the DRIFT-v22
+# neffnoise 1.7B run (run_qwen3_1p7b_base_pivot_v22_neffnoise.sh). Identical
+# data / reward (strict-box \boxed{}) / batch 1024 / KL / clip 0.2-0.2 /
+# use_kl_in_reward=False / resp_len 16384. Only difference vs neffnoise is
+# DRIFT on/off. Scaled-down replica of run_qwen3_4b_base_grpo_rebuttal.sh.
 set -x
 
 DATA_DIR="${DATA_DIR:-/home/escanord/duy/data/guru_rl}"
-MODEL="${MODEL:-/home/escanord/duy/checkpoints/models/Qwen3-4B-Base}"
+MODEL="${MODEL:-/home/escanord/duy/checkpoints/models/Qwen3-1.7B-Base}"
 REWARD_FN="$(dirname "$0")/guru_rl_reward.py"
 
 train_files="$DATA_DIR/train.parquet"
 val_files="['$DATA_DIR/test_aime.parquet','$DATA_DIR/test_aime25.parquet','$DATA_DIR/test_math500.parquet','$DATA_DIR/test_gpqa_diamond.parquet','$DATA_DIR/test_olympiadbench_math_en.parquet']"
 
-CKPT_DIR=/home/escanord/duy/checkpoints/verl/pivot-v22/qwen3_4b_base_peak
+CKPT_DIR=/home/escanord/duy/checkpoints/verl/grpo/qwen3_1p7b_base_matched
 
 source /home/escanord/duy/venv-vault/miniconda3/etc/profile.d/conda.sh
 conda activate verl
 
-export VERL_FILE_LOGGER_ROOT=/home/escanord/duy/checkpoints/verl/pivot-v22
+export VERL_FILE_LOGGER_ROOT=/home/escanord/duy/checkpoints/verl/grpo
 export VERL_VLLM_DISABLE_CASCADE_ATTN=1
 export VERL_VLLM_CUDAGRAPH_MODE=PIECEWISE
 export VLLM_FLASH_ATTN_VERSION=2
@@ -63,33 +57,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
-    +actor_rollout_ref.rollout.pivot.pivot_version=2 \
-    +actor_rollout_ref.rollout.pivot.langevin_rollout=True \
-    +actor_rollout_ref.rollout.pivot.entropy_trigger_only=True \
-    +actor_rollout_ref.rollout.pivot.trig_percentile=85 \
-    +actor_rollout_ref.rollout.pivot.entropy_threshold=0.4 \
-    +actor_rollout_ref.rollout.pivot.langevin_K=1 \
-    +actor_rollout_ref.rollout.pivot.langevin_top_k=128 \
-    +actor_rollout_ref.rollout.pivot.langevin_eta=0.1 \
-    +actor_rollout_ref.rollout.pivot.langevin_sigma=0.01 \
-    +actor_rollout_ref.rollout.pivot.langevin_tmin=400 \
-    +actor_rollout_ref.rollout.pivot.langevin_tmin_mode=peak \
-    +actor_rollout_ref.rollout.pivot.langevin_tmin_cap=3200 \
-    +actor_rollout_ref.rollout.pivot.langevin_tmin_peak_alpha=0.6 \
-    +actor_rollout_ref.rollout.pivot.langevin_mask_eos=True \
-    +actor_rollout_ref.rollout.pivot.langevin_momentum=0.7 \
-    +actor_rollout_ref.rollout.pivot.langevin_feedback=True \
-    +actor_rollout_ref.rollout.pivot.langevin_exploit_ratio=1.0 \
-    +actor_rollout_ref.rollout.pivot.langevin_alpha_target=0.7 \
-    +actor_rollout_ref.actor.pivot.pivot_version=2 \
-    +actor_rollout_ref.actor.pivot.lan_grpo_coeff=1.0 \
-    +actor_rollout_ref.actor.pivot.lan_grpo_soft_is=True \
-    +actor_rollout_ref.actor.pivot.n_rollouts_per_prompt=8 \
-    +actor_rollout_ref.actor.pivot.entropy_trigger_only=True \
-    +actor_rollout_ref.actor.pivot.trig_percentile=85 \
-    +actor_rollout_ref.actor.pivot.lan_grpo_restrict_to_trigger=False \
-    +actor_rollout_ref.actor.pivot.langevin_eta=0.1 \
-    +actor_rollout_ref.actor.pivot.langevin_top_k=128 \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.2 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
@@ -99,8 +66,8 @@ python3 -m verl.trainer.main_ppo \
     reward.custom_reward_function.name=compute_score \
     trainer.critic_warmup=0 \
     trainer.logger='["console","file"]' \
-    trainer.project_name='verl_pivot_v22_qwen3_guru_rl' \
-    trainer.experiment_name="qwen3_4b_base_pivot_v22_peak_${SLURM_JOB_ID:-manual}" \
+    trainer.project_name='verl_grpo_qwen3_guru_rl' \
+    trainer.experiment_name="qwen3_1p7b_base_grpo_matched_${SLURM_JOB_ID:-manual}" \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
